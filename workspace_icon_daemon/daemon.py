@@ -827,7 +827,11 @@ class WorkspaceIconDaemon:
         """
         logger.debug("Creating icon font...")
 
-        icon_paths = program_icon_map.get_all_icon_paths_ordered()
+        entries = sorted(
+            (entry for entry in program_icon_map.programs.values() if entry.icon_path is not None),
+            key=lambda entry: entry.unicode_id,
+        )
+        icon_paths = [entry.icon_path for entry in entries]
 
         if not icon_paths:
             logger.warning("No icons to add to font")
@@ -840,6 +844,7 @@ class WorkspaceIconDaemon:
             font_family_name=font_family_name,
             pua_start=PUA_START,
             remove_original_symbols=True,
+            codepoints=[entry.unicode_id for entry in entries],
         )
         builder.build_complete_font()
         builder.save()

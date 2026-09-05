@@ -3,12 +3,17 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
 
+from fontTools.ttLib import TTFont
+from PIL import Image
+
 from workspace_icon_daemon.daemon import (
+    DEFAULT_BASE_FONT_PATH,
     ProgramIconMap,
     UniqueIconsMode,
     WorkspaceIconDaemon,
     parse_arguments,
 )
+from workspace_icon_daemon.font_builder import FontBuilder
 from workspace_icon_daemon.platform import Compositor
 
 
@@ -37,6 +42,40 @@ class FakeConnection:
 
 
 class DaemonTests(TestCase):
+    def test_font_rebuild_preserves_codepoints_after_icon_removal(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            icon_map = ProgramIconMap(root / "programs.yaml")
+            for name, color in [("removed", "red"), ("retained", "blue")]:
+                path = root / f"{name}.png"
+                Image.new("RGBA", (32, 32), color).save(path)
+                icon_map.add_program(name, path)
+            icon_map.add_program("iconless", None)
+            icon_map.save()
+            (root / "removed.png").unlink()
+
+            restored = ProgramIconMap(icon_map.filepath)
+            self.assertTrue(restored.modified_at_load)
+            self.assertEqual(restored.get_unicode_id("retained"), 0xE001)
+            # Shared icon paths must still receive their own assigned glyphs.
+            restored.add_program("another", root / "retained.png")
+            output = root / "font.ttf"
+            WorkspaceIconDaemon.create_icon_font(
+                restored, DEFAULT_BASE_FONT_PATH, output, "TestIcons"
+            )
+
+            with TTFont(output) as font:
+                cmap = font.getBestCmap()
+                self.assertEqual(
+                    {cp for cp in cmap if 0xE000 <= cp <= 0xF8FF},
+                    {0xE001, 0xE002},
+                )
+                target_px = font["CBLC"].strikes[0].bitmapSizeTable.ppemY
+                expected = FontBuilder.collect_image(root / "retained.png", target_px)
+                for name in ("retained", "another"):
+                    glyph = cmap[restored.get_unicode_id(name)]
+                    self.assertEqual(font["CBDT"].strikeData[0][glyph].imageData, expected)
+
     def test_program_icon_map_round_trip(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

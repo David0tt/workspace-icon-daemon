@@ -43,6 +43,7 @@ class FontBuilder:
         font_family_name: str = "MyCreatedIconFont",
         pua_start: int = PUA_START,
         remove_original_symbols: bool = False,
+        codepoints: list[int] | None = None,
     ) -> None:
         """Initialize the FontBuilder.
 
@@ -54,6 +55,8 @@ class FontBuilder:
             pua_start: Starting code point in the Private Use Area.
             remove_original_symbols: If True, remove all original symbols from
                 the base font, keeping only the newly added icons.
+            codepoints: Explicit PUA codepoints in image_paths order. If omitted,
+                allocate sequentially from pua_start.
         """
         self.base_font_path = base_font_path
         self.output_font_path = output_font_path
@@ -61,6 +64,14 @@ class FontBuilder:
         self.font_family_name = font_family_name
         self.pua_start = pua_start
         self.remove_original_symbols = remove_original_symbols
+        if codepoints is not None:
+            if len(codepoints) != len(image_paths):
+                raise ValueError("Each image must have exactly one codepoint")
+            if any(type(cp) is not int or not 0xE000 <= cp <= 0xF8FF for cp in codepoints):
+                raise ValueError("Codepoints must be integers in U+E000..U+F8FF")
+            if len(set(codepoints)) != len(codepoints):
+                raise ValueError("Codepoints must be unique")
+        self.codepoints = list(codepoints) if codepoints is not None else None
         self.ttfont: TTFont | None = None
         self.strike_index: int = 0
         self.ppem_x: int = 0
@@ -378,7 +389,12 @@ class FontBuilder:
         s_typo_ascender = os2_table.sTypoAscender
         s_typo_descender = os2_table.sTypoDescender
 
-        pua_iter = self._next_pua()
+        pua_iter = iter(self.codepoints) if self.codepoints is not None else self._next_pua()
+        if self.codepoints is not None:
+            if len(self.codepoints) != len(images):
+                raise ValueError("Each image must have exactly one codepoint")
+            if any(cp in best_cmap for cp in self.codepoints):
+                raise ValueError("Requested codepoint is already mapped in the font")
 
         for path, data in images:
             actual_size = self.png_size(data)
