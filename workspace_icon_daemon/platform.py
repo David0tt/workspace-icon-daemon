@@ -71,7 +71,20 @@ class FontInstaller:
     fonts_dir: Path
 
     def install(self, source: Path) -> Path:
-        """Copy a font into the user font directory and refresh consumers."""
+        """Copy a font into the user font directory and refresh consumers.
+
+        This method performs a careful installation sequence to avoid bar crashes:
+        1. Stop bar (prevents crash when modifying active font)
+        2. Copy font to ~/.local/share/fonts
+        3. Restart bar
+        4. Refresh font cache with fc-cache
+        5. Restart bar again (to load updated cache)
+
+        This sequence is necessary because:
+        - bar crashes if its active font file is modified
+        - fc-cache is slow and shouldn't block bar restart
+        - simply using a compository reload/restart is not enough to ensure fonts are reloaded properly
+        """
         if not source.is_file():
             raise FileNotFoundError(f"Font file does not exist: {source}")
 
@@ -88,6 +101,17 @@ class FontInstaller:
             )
 
         shutil.copy2(source, destination)
+
+        # Restart the bar immediately so the slow font-cache refresh does not
+        # leave it unavailable.
+        if self.bar is not Bar.NONE:
+            subprocess.Popen(
+                [self.bar.value],
+                start_new_session=True,
+                stdout=devnull,
+                stderr=devnull,
+            )
+
         subprocess.run(
             ["fc-cache", "-f", str(self.fonts_dir)],
             check=True,
@@ -95,7 +119,14 @@ class FontInstaller:
             stderr=devnull,
         )
 
+        # Restart once more so the bar loads the newly refreshed font cache.
         if self.bar is not Bar.NONE:
+            subprocess.run(
+                ["pkill", self.bar.value],
+                check=False,
+                stdout=devnull,
+                stderr=devnull,
+            )
             subprocess.Popen(
                 [self.bar.value],
                 start_new_session=True,

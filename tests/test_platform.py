@@ -1,9 +1,13 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import patch
 
 from workspace_icon_daemon.platform import (
     Bar,
     Compositor,
+    FontInstaller,
     detect_compositor,
     program_name,
     resolve_bar,
@@ -48,3 +52,30 @@ class PlatformTests(TestCase):
         self.assertIs(resolve_bar(Bar.AUTO, Compositor.I3), Bar.I3BAR)
         self.assertIs(resolve_bar(Bar.AUTO, Compositor.SWAY), Bar.WAYBAR)
         self.assertIs(resolve_bar(Bar.NONE, Compositor.SWAY), Bar.NONE)
+
+    @patch("workspace_icon_daemon.platform.subprocess.Popen")
+    @patch("workspace_icon_daemon.platform.subprocess.run")
+    def test_font_install_restarts_bar_before_and_after_cache_refresh(
+        self, run, popen
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "generated.ttf"
+            source.write_bytes(b"font")
+            fonts_dir = root / "fonts"
+
+            destination = FontInstaller(Bar.WAYBAR, fonts_dir).install(source)
+
+        self.assertEqual(destination, fonts_dir / source.name)
+        self.assertEqual(
+            [invocation.args[0] for invocation in run.call_args_list],
+            [
+                ["pkill", "waybar"],
+                ["fc-cache", "-f", str(fonts_dir)],
+                ["pkill", "waybar"],
+            ],
+        )
+        self.assertEqual(
+            [invocation.args[0] for invocation in popen.call_args_list],
+            [["waybar"], ["waybar"]],
+        )

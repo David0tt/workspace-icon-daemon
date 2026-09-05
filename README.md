@@ -7,39 +7,59 @@
 [TODO: example swaybar image]
 *Example: swaybar showing workspaces with icons for currently running programs*
 
-Workspace Icon Daemon shows the applications on each workspace as color icons. It supports both i3 and Sway through their shared IPC protocol and generates a small icon font from the desktop icons already installed on the system.
 
-This is a new project that replaces `i3-workspace-icons` and `sway-workspace-icons`. It intentionally uses new command names, package names, font names, and XDG directories; data from either earlier project is not imported.
+Dynamically show running application icons in workspace names on **Sway and i3**.
+
+The daemon finds system application icons, builds a color icon font, and updates
+workspace names when windows open, close or move to different workspaces.
+
+This approach should work on almost any bar that has font rendering capabilities. i3bar and waybar are explicitly tested. Crucially, this does not require image rendering capabilities by the bar, since a font with the appropriate program icons is created on the fly. 
+
+Minor modifications may be needed when using a bar different from i3bar or swaybar, to correctly restart the bar. This is required, since whenever a compeletely new program is opened, the icon font is recreated with this additional icon and a reload of the bar is required afterwards. 
+
 
 ## Features
-
-- Automatically detects i3 or Sway, with an explicit override when needed
-- Reads `WM_CLASS` on i3 and both Wayland `app_id` and XWayland `WM_CLASS` on Sway
-- Supports i3bar, Waybar, or no automatic bar restart
-- Resolves application icons through desktop files and common icon themes
-- Generates a color bitmap font from SVG and PNG icons
-- Shows duplicate applications individually, once, or with subscript/superscript counts
+- Automatically detects and displays the correct icon for any program.
+- Automatically detects i3 or Sway, with an explicit override when needed.
+- Supports i3bar, Waybar, or no automatic bar restart. 
+- Supports program count indicators as sub-/superscripts when multiple instances of the same program are running.
 
 ## Installation
 
-The system needs Fontconfig and Cairo. On Debian or Ubuntu:
+Workspace Icon Daemon requires Python 3.10 or newer, pip, Python's `venv`
+module, Fontconfig, Cairo, and procps (`pgrep`/`pkill`).
+
+On Debian or Ubuntu, install them with:
 
 ```sh
-sudo apt install fontconfig libcairo2
+sudo apt install python3 python3-pip python3-venv fontconfig libcairo2 procps
 ```
 
-Install the Python package:
+On Arch Linux, install them with:
+
+```sh
+sudo pacman -S python python-pip fontconfig cairo procps-ng
+```
+
+Clone the repository, create a dedicated virtual environment, and install the
+package into it:
 
 ```sh
 git clone https://github.com/David0tt/workspace-icon-daemon
-pip install ./workspace-icon-daemon
+python3 -m venv ~/.local/share/workspace-icon-daemon/venv
+~/.local/share/workspace-icon-daemon/venv/bin/python -m pip install ./workspace-icon-daemon
 ```
+
+The daemon executable is then available at
+`~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon`. The
+configuration examples below use this path, so activating the virtual
+environment is not required when the window manager starts the daemon.
 
 ## Configuration
 
-Use `WorkspaceIconDaemon` as the bar font. The daemon keeps the numeric prefix in workspace names, so workspace keybindings should select workspaces by number.
+Use `WorkspaceIconDaemon` as the bar font. 
 
-For i3:
+For i3, edit the i3 config:
 
 ```i3config
 bar {
@@ -47,9 +67,7 @@ bar {
     height 30
 }
 
-exec_always --no-startup-id workspace-icon-daemon
-bindsym $mod+1 workspace number 1
-bindsym $mod+2 workspace number 2
+exec_always --no-startup-id ~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon
 ```
 
 For Sway with Waybar, add the font to `~/.config/waybar/style.css`:
@@ -63,37 +81,44 @@ For Sway with Waybar, add the font to `~/.config/waybar/style.css`:
 Then add this to the Sway config:
 
 ```swayconfig
-exec_always workspace-icon-daemon
-bindsym $mod+1 workspace number 1
-bindsym $mod+2 workspace number 2
+exec_always ~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon
 ```
 
 Automatic detection chooses i3bar for i3 and Waybar for Sway. Override either decision when necessary:
 
 ```sh
-workspace-icon-daemon --compositor sway --bar none
-workspace-icon-daemon --compositor sway --bar i3bar
+~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway --bar none
+~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway --bar i3bar
 ```
 
 `--bar none` installs and refreshes the font cache without managing a bar process.
 
-## Options
+
+On either window manager, use workspace **numbers** for switching and moving
+windows, because names change dynamically:
 
 ```text
---compositor {auto,i3,sway}
---bar {auto,i3bar,waybar,none}
---unique-icons {nonunique,numbers_superscript,numbers_subscript,unique}
---no-placeholder-icon
---rebuild
---full-rebuild
---program-icon-map PATH
---base-font PATH
---font-output PATH
---font-family-name NAME
---verbose
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+# Repeat for your remaining numbered workspaces.
 ```
 
-The new persistent paths are:
+## Options
+The most important options you might want to use. Use `--help` for a full list.
+```bash
+workspace-icon-daemon --help                                # Show all options
+workspace-icon-daemon --unique-icons                        # Display mode: nonunique | unique | numbers_subscript | numbers_superscript
+workspace-icon-daemon --no-placeholder-icon                 # Don't use placeholder icons when program icons are not found
+workspace-icon-daemon --compositor {auto,i3,sway}           # Explicitly specify the compositor
+workspace-icon-daemon --bar {auto,i3bar,waybar,none}        # Explicitly specify the bar
+workspace-icon-daemon --rebuild                             # rediscover icons and rebuild the font from the saved icon map
+workspace-icon-daemon --full-rebuild                        # delete the icon map and cached font, then rediscover and rebuild
+workspace-icon-daemon --verbose                             # Enable debug output
+``` 
+
+The persistent paths are:
 
 - `$XDG_CONFIG_HOME/workspace-icon-daemon/program_icon_map.yaml`
 - `$XDG_CACHE_HOME/workspace-icon-daemon/WorkspaceIconDaemon.ttf`
@@ -103,13 +128,46 @@ The usual XDG defaults apply when those environment variables are unset.
 
 ## How it works
 
-The daemon listens for window and workspace events over i3 IPC. For each application it finds a desktop entry, resolves the associated SVG or PNG icon, assigns a Private Use Area codepoint, and rebuilds a color bitmap font when a previously unseen application appears. It then renames each workspace to a value such as `2: <icons>`.
+The daemon listens for window and workspace events over i3 IPC. For each application it finds a desktop entry, resolves the associated SVG or PNG icon, assigns a Private Use Area Unicode codepoint, and rebuilds a color bitmap font when a previously unseen application appears. It then renames each workspace to a value such as `2: <icons>`.
 
 On SIGINT or SIGTERM it restores each workspace to its numeric name before exiting.
 
 ## Development
 
 ```sh
+python3 -m venv .venv
+. .venv/bin/activate
 python -m pip install -e .
 python -m unittest discover
 ```
+
+## Limitations
+
+- When opening new programs, bar restarts can cause brief flicker. This is required, since the font may not be changed while the bar is using it. For simultaneous sessions, custom bar launch arguments, or bars supervised by systemd, use `--bar none` and arrange font reloads through your bar manager.
+- Numbers indicating program counts use subscripts/superscripts, which disrupt equal spacing between icons. A better solution might use Unicode diacritics or embed numbers directly in icons, but this has not been implemented yet. 
+
+## How It Works
+
+Since most bars cannot display images directly, this daemon creates a custom font from program icons on-the-fly:
+
+1. The daemon monitors window events (new, close, move)
+2. When a new program is detected:
+   - Finds the program's `.desktop` file
+   - Extracts the `Icon=` entry to locate the icon file in standard system directories
+   - Assigns the program a Unicode codepoint in the Private Use Area (PUA)
+   - Rebuilds the custom font with all known icons
+   - Stops bar (to prevent crashes when modifying the active font)
+   - Installs the font
+   - Restarts bar
+   - Reloads the font cache with `fc-cache`
+   - Restarts bar again to load the updated cache
+3. Workspace names are updated with icon characters from the custom font whenever window events occur
+4. A program-to-icon map is persisted for consistency and fast restarts. The font is only rebuilt when a completely new program is encountered
+
+
+### Possible Future Features
+
+- [ ] Limit maximum number of icons shown per workspace
+- [ ] Better icon spacing when using count indicators
+- [ ] support for different bars. In theory, this works, with any bar that shows workspaces by their title, and where you can set the font (and that has a reasonable font rendering support, e.g. for emojis). However, the updating sequence needs to be modified, depending on the bar. 
+- [ ] graceful restart currently does not work: If you add the workspace-icon-daemon to your config with exec_always, this could lead to multiple daemon processes being created, whenever you reload the window manager. Further, the daemon closes and starts the bar, thereby taking ownership of this child process, so on window manager reload a second bar is started. To the best of my knowledge everything works when the whole system is restarted, but of course this could be improved. 
