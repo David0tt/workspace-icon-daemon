@@ -140,6 +140,7 @@ python -m unittest discover
 
 - When opening new programs, bar restarts can cause brief flicker. This is required, since the font may not be changed while the bar is using it. For simultaneous sessions, custom bar launch arguments, or bars supervised by systemd, use `--bar none` and arrange font reloads through your bar manager.
 - Numbers indicating program counts use subscripts/superscripts, which disrupt equal spacing between icons. A better solution might use Unicode diacritics or embed numbers directly in icons, but this has not been implemented yet. 
+- This system is relatively hacky. If you want something simpler, you can use the default approach of mapping programs to nerdfont symbols used by many other setups. 
 
 ## How It Works
 
@@ -166,3 +167,13 @@ Since most bars cannot display images directly, this daemon creates a custom fon
 - [ ] Better icon spacing when using count indicators
 - [ ] support for different bars. In theory, this works, with any bar that shows workspaces by their title, and where you can set the font (and that has a reasonable font rendering support, e.g. for emojis). However, the updating sequence needs to be modified, depending on the bar. 
 - [ ] graceful restart currently does not work: If you add the workspace-icon-daemon to your config with exec_always, this could lead to multiple daemon processes being created, whenever you reload the window manager. Further, the daemon closes and starts the bar, thereby taking ownership of this child process, so on window manager reload a second bar is started. To the best of my knowledge everything works when the whole system is restarted, but of course this could be improved. 
+
+
+## Inspiration
+
+This project is inspired by:
+- [i3-workspace-names-daemon](https://github.com/cboddy/i3-workspace-names-daemon)
+- [i3scripts/autoname_workspaces.py](https://github.com/justbuchanan/i3scripts)
+- [sway-dynamic-names](https://github.com/j-waters/sway-dynamic-names)
+
+Unlike these projects, which rely on pre-existing icon fonts (like FontAwesome or Nerd Fonts) with predefined program-to-icon mappings, my daemon uses actual program icons from your system. Therefore in contrast to these other tools it can 1. show color icons 2.show icons for almost any program automatically. If you encounter a program, where no icon or the wrong icon is shown, please let me know in an issue. 
