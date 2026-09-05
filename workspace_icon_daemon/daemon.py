@@ -21,6 +21,7 @@ from types import FrameType
 
 import i3ipc
 import yaml
+from fontTools.ttLib import TTFont
 
 from .font_builder import FontBuilder
 from .platform import (
@@ -1120,13 +1121,7 @@ class WorkspaceIconDaemon:
         """Run the daemon main loop."""
         logger.info("Starting workspace icon daemon...")
 
-        new_programs_added = self.process_new_programs()
-
-        if self.program_icon_map.modified_at_load or new_programs_added:
-            logger.debug("Font modified at startup, installing...")
-            self.install_icon_font()
-        else:
-            logger.debug("Font unchanged at startup, skipping installation")
+        self.ensure_startup_font()
 
         self.update_workspace_names()
 
@@ -1141,6 +1136,62 @@ class WorkspaceIconDaemon:
 
         logger.info("Daemon is running. Press Ctrl+C to exit.")
         self.connection.main()
+
+    def ensure_startup_font(self) -> None:
+        """Recover cached and installed fonts before publishing workspace names."""
+        rebuilt = self.process_new_programs()
+        entries = [
+            entry for entry in self.program_icon_map.programs.values()
+            if entry.icon_path is not None
+        ]
+        if not entries:
+            logger.debug("No mapped icons; no font installation needed")
+            return
+
+        if not rebuilt and self._cached_font_is_stale(entries):
+            logger.info("Cached icon font is missing or stale; rebuilding")
+            self.create_icon_font(
+                self.program_icon_map, self.base_font_path,
+                self.font_output_path, self.font_family_name,
+            )
+            rebuilt = True
+
+        destination = self.font_installer.fonts_dir / self.font_output_path.name
+        if (
+            rebuilt
+            or not destination.is_file()
+            or destination.read_bytes() != self.font_output_path.read_bytes()
+        ):
+            self.install_icon_font()
+        else:
+            logger.debug("Cached and installed icon fonts are current")
+        self.program_icon_map.modified_at_load = False
+
+    def _cached_font_is_stale(self, entries: list[ProgramIconEntry]) -> bool:
+        """Check input timestamps, mappings, family, and required font tables."""
+        if self.program_icon_map.modified_at_load or not self.font_output_path.is_file():
+            return True
+        timestamp = self.font_output_path.stat().st_mtime_ns
+        inputs = [self.program_icon_map.filepath, self.base_font_path]
+        inputs.extend(entry.icon_path for entry in entries if entry.icon_path is not None)
+        if any(path.stat().st_mtime_ns > timestamp for path in inputs):
+            return True
+        try:
+            with TTFont(self.font_output_path) as font:
+                cmap = font.getBestCmap() or {}
+                expected = {entry.unicode_id for entry in entries}
+                actual = {cp for cp in cmap if 0xE000 <= cp <= 0xF8FF}
+                if actual != expected:
+                    return True
+                if font["name"].getDebugName(1) != self.font_family_name:
+                    return True
+                font["CBLC"]
+                bitmaps = font["CBDT"].strikeData[0]
+                return any(cmap[cp] not in bitmaps for cp in expected)
+        except Exception as exc:
+            # Invalid/truncated caches are disposable; rebuild from source icons.
+            logger.warning("Cannot validate cached icon font: %s", exc)
+            return True
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
