@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workspace-icon-daemon"
+version = "0.1.0"
+description = "Dynamic application icons in i3 and Sway workspace names"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "David Ott"}]
+keywords = ["i3", "sway", "workspace", "icons", "font"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Desktop Environment :: Window Managers",
+]
+dependencies = [
+    "i3ipc>=2.2.1",
+    "PyYAML>=6.0",
+    "fonttools>=4.38.0",
+    "Pillow>=9.5.0",
+    "cairosvg>=2.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/David0tt/workspace-icon-daemon"
+Repository = "https://github.com/David0tt/workspace-icon-daemon"
+Issues = "https://github.com/David0tt/workspace-icon-daemon/issues"
+
+[project.scripts]
+workspace-icon-daemon = "workspace_icon_daemon.daemon:main"
+
+[tool.setuptools]
+packages = ["workspace_icon_daemon"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+workspace_icon_daemon = ["*.ttf", "*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
