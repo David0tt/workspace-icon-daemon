@@ -126,11 +126,6 @@ The persistent paths are:
 
 The usual XDG defaults apply when those environment variables are unset.
 
-## How it works
-
-The daemon listens for window and workspace events over i3 IPC. For each application it finds a desktop entry, resolves the associated SVG or PNG icon, assigns a Private Use Area Unicode codepoint, and rebuilds a color bitmap font when a previously unseen application appears. It then renames each workspace to a value such as `2: <icons>`.
-
-On SIGINT or SIGTERM it restores each workspace to its numeric name before exiting.
 
 ## Development
 
@@ -150,18 +145,18 @@ python -m unittest discover
 
 Since most bars cannot display images directly, this daemon creates a custom font from program icons on-the-fly:
 
-1. The daemon monitors window events (new, close, move)
+1. The daemon monitors window events (new, close, move) over i3 IPC
 2. When a new program is detected:
    - Finds the program's `.desktop` file
    - Extracts the `Icon=` entry to locate the icon file in standard system directories
    - Assigns the program a Unicode codepoint in the Private Use Area (PUA)
-   - Rebuilds the custom font with all known icons
+   - Rebuilds the custom color bitmap font with all known icons when a previously unseen application appears
    - Stops bar (to prevent crashes when modifying the active font)
    - Installs the font
    - Restarts bar
    - Reloads the font cache with `fc-cache`
    - Restarts bar again to load the updated cache
-3. Workspace names are updated with icon characters from the custom font whenever window events occur
+3. Workspace names are updated with icon characters from the custom font whenever window events occur to values like `2: <icons>`
 4. A program-to-icon map is persisted for consistency and fast restarts. The font is only rebuilt when a completely new program is encountered
 
 
