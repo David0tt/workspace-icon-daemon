@@ -725,42 +725,49 @@ class WorkspaceIconDaemon:
 
     @staticmethod
     def _preferred_icon_search_paths(extension: str) -> list[Path]:
-        """Return preferred application-icon directories in quality order."""
+        """Return preferred application-icon directories in XDG precedence order."""
         if extension == "svg":
-            return [
-                Path("/usr/share/icons/hicolor/scalable/apps"),
-                Path("/usr/share/icons/Humanity/apps/16"),
-                Path("/usr/share/icons/Humanity/apps/22"),
-                Path("/usr/share/icons/Humanity/apps/24"),
-                Path("/usr/share/icons/Humanity/apps/32"),
-                Path("/usr/share/icons/Humanity/apps/48"),
-                Path("/usr/share/icons/Humanity/apps/64"),
-                Path("/usr/share/icons/Humanity/apps/128"),
-                Path("/usr/share/icons/Humanity/apps/192"),
-                Path("/usr/share/icons/HighContrast/scalable/apps"),
-                Path("/usr/share/pixmaps"),
+            relative_paths = [
+                Path("icons/hicolor/scalable/apps"),
+                Path("icons/Humanity/apps/16"),
+                Path("icons/Humanity/apps/22"),
+                Path("icons/Humanity/apps/24"),
+                Path("icons/Humanity/apps/32"),
+                Path("icons/Humanity/apps/48"),
+                Path("icons/Humanity/apps/64"),
+                Path("icons/Humanity/apps/128"),
+                Path("icons/Humanity/apps/192"),
+                Path("icons/HighContrast/scalable/apps"),
+                Path("pixmaps"),
             ]
-        if extension == "png":
+        elif extension == "png":
             # The bundled font's bitmap strike is 109px. Prefer the nearest
             # source that does not need upscaling, then larger sources, followed
             # by progressively smaller fallbacks.
-            return [
-                Path("/usr/share/icons/hicolor/128x128/apps"),
-                Path("/usr/share/icons/hicolor/192x192/apps"),
-                Path("/usr/share/icons/hicolor/256x256/apps"),
-                Path("/usr/share/icons/hicolor/512x512/apps"),
-                Path("/usr/share/icons/hicolor/96x96/apps"),
-                Path("/usr/share/icons/hicolor/72x72/apps"),
-                Path("/usr/share/icons/hicolor/64x64/apps"),
-                Path("/usr/share/icons/hicolor/48x48/apps"),
-                Path("/usr/share/icons/hicolor/36x36/apps"),
-                Path("/usr/share/icons/hicolor/32x32/apps"),
-                Path("/usr/share/icons/hicolor/24x24/apps"),
-                Path("/usr/share/icons/hicolor/22x22/apps"),
-                Path("/usr/share/icons/hicolor/16x16/apps"),
-                Path("/usr/share/pixmaps"),
+            relative_paths = [
+                Path("icons/hicolor/128x128/apps"),
+                Path("icons/hicolor/192x192/apps"),
+                Path("icons/hicolor/256x256/apps"),
+                Path("icons/hicolor/512x512/apps"),
+                Path("icons/hicolor/96x96/apps"),
+                Path("icons/hicolor/72x72/apps"),
+                Path("icons/hicolor/64x64/apps"),
+                Path("icons/hicolor/48x48/apps"),
+                Path("icons/hicolor/36x36/apps"),
+                Path("icons/hicolor/32x32/apps"),
+                Path("icons/hicolor/24x24/apps"),
+                Path("icons/hicolor/22x22/apps"),
+                Path("icons/hicolor/16x16/apps"),
+                Path("pixmaps"),
             ]
-        raise ValueError(f"Unsupported icon extension: {extension}")
+        else:
+            raise ValueError(f"Unsupported icon extension: {extension}")
+
+        return [
+            data_dir / relative_path
+            for data_dir in WorkspaceIconDaemon._xdg_data_dirs()
+            for relative_path in relative_paths
+        ]
 
     @staticmethod
     def _global_icon_search(icon_name: str, extension: str) -> Path | None:
@@ -799,6 +806,14 @@ class WorkspaceIconDaemon:
     @staticmethod
     def _icon_search_roots() -> list[Path]:
         """Return icon roots in user/system precedence order."""
+        roots: list[Path] = []
+        for directory in WorkspaceIconDaemon._xdg_data_dirs():
+            roots.extend([directory / "icons", directory / "pixmaps"])
+        return roots
+
+    @staticmethod
+    def _xdg_data_dirs() -> list[Path]:
+        """Return de-duplicated XDG data directories in lookup order."""
         data_dirs = [get_xdg_data_home()]
         data_dirs.extend(
             Path(item)
@@ -807,10 +822,7 @@ class WorkspaceIconDaemon:
             ).split(":")
             if item
         )
-        roots: list[Path] = []
-        for directory in data_dirs:
-            roots.extend([directory / "icons", directory / "pixmaps"])
-        return list(dict.fromkeys(roots))
+        return list(dict.fromkeys(data_dirs))
 
     @staticmethod
     def _installed_icon_index() -> dict[str, Path]:

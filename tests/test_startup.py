@@ -157,6 +157,59 @@ class StartupTests(TestCase):
 
         self.assertEqual(icon_index["example"], color_png)
 
+    def test_user_icon_overrides_same_named_system_icon(self) -> None:
+        user_data = self.root / "user-share"
+        system_data = self.root / "system-share"
+        user_icons = user_data / "icons" / "hicolor" / "scalable" / "apps"
+        system_icons = system_data / "icons" / "hicolor" / "scalable" / "apps"
+        user_icons.mkdir(parents=True)
+        system_icons.mkdir(parents=True)
+        user_icon = user_icons / "example.svg"
+        user_icon.write_text("<svg id='user'/>", encoding="utf-8")
+        (system_icons / "example.svg").write_text(
+            "<svg id='system'/>", encoding="utf-8"
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "XDG_DATA_HOME": str(user_data),
+                "XDG_DATA_DIRS": str(system_data),
+            },
+        ):
+            icon_index = self.daemon._installed_icon_index()
+
+        self.assertEqual(icon_index["example"], user_icon)
+
+    def test_preferred_icon_paths_follow_xdg_data_directory_order(self) -> None:
+        user_data = self.root / "user-share"
+        first_system_data = self.root / "first-system-share"
+        second_system_data = self.root / "second-system-share"
+
+        with patch.dict(
+            "os.environ",
+            {
+                "XDG_DATA_HOME": str(user_data),
+                "XDG_DATA_DIRS": (
+                    f"{first_system_data}:{second_system_data}:{first_system_data}"
+                ),
+            },
+        ):
+            paths = WorkspaceIconDaemon._preferred_icon_search_paths("svg")
+
+        scalable_suffix = Path("icons/hicolor/scalable/apps")
+        scalable_paths = [
+            path for path in paths if path.parts[-4:] == scalable_suffix.parts
+        ]
+        self.assertEqual(
+            scalable_paths,
+            [
+                user_data / scalable_suffix,
+                first_system_data / scalable_suffix,
+                second_system_data / scalable_suffix,
+            ],
+        )
+
     def test_png_precedence_prefers_128_over_larger_and_smaller_icons(self) -> None:
         directories = {
             size: self.root / "hicolor" / f"{size}x{size}" / "apps"

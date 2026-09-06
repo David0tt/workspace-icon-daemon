@@ -182,22 +182,32 @@ Since most bars cannot display images directly, this daemon creates a custom fon
       3. /var/lib/snapd/desktop/applications
    2. For each `.desktop` file, the daemon extracts the `Icon=`
    and `StartupWMClass=` values.
-   3. Icon discsovery. Icons are found following the following precedence:
+   3. Icons are discovered with the following precedence:
       1. An absolute SVG or PNG path specified directly by `Icon=`.
-      2. SVG application icons, in order:
-         1. `hicolor/scalable/apps`
-         2. Humanity application-icon directories
-         3. `HighContrast/scalable/apps`
-         4. `/usr/share/pixmaps`
-      3. PNG application icons, in order:
-         1. `hicolor` application-icon directories going through the resolutions beginning at 124x124 (Note that the target font uses a strike of 109×109 pixels, so input resolutions closest to this are preferred)
-         2. `/usr/share/pixmaps`
+      2. SVG application icons. The daemon searches `$XDG_DATA_HOME` first,
+         followed by each directory in `$XDG_DATA_DIRS`. Within each data
+         directory it checks, in order:
+         1. `icons/hicolor/scalable/apps`
+         2. `icons/Humanity/apps` application-icon directories
+         3. `icons/HighContrast/scalable/apps`
+         4. `pixmaps`
+      3. PNG application icons, using the same XDG data-directory precedence.
+         Within each data directory it checks:
+         1. `icons/hicolor` application-icon directories, starting at 128×128,
+            then larger sources, followed by progressively smaller fallbacks.
+            The target font uses a 109×109 pixel strike, so nearby resolutions
+            are preferred to avoid upscaling.
+         2. `pixmaps`
       4. Recursive SVG fallback search through:
          1. `$XDG_DATA_HOME/icons`
          2. `$XDG_DATA_HOME/pixmaps`
          3. The corresponding `icons` and `pixmaps` directories under `$XDG_DATA_DIRS`
       5. Recursive PNG fallback search through the same directories.
-      6. Note: The explicit application-ion directories are searched before recursive theme fallbacks. This prevents symbolic or monochrome theme icons from overriding full-color application icons in hicolor.
+      6. Note: The explicit application-icon directories are searched before recursive
+         theme fallbacks. This prevents symbolic or monochrome theme icons from
+         overriding full-color application icons in hicolor. Within each
+         format/search tier, user-installed icons under `$XDG_DATA_HOME` take
+         precedence over identically named icons in system data directories.
 2. It reserves U+E000 for the placeholder icon and assigns stable PUA (Private Use Area) 
    Unicode  codepoints to discovered applications.
 3. The first run builds the custom icon font, atomically installs it, refreshes fontconfig,
