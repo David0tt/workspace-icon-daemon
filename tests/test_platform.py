@@ -79,3 +79,20 @@ class PlatformTests(TestCase):
             [invocation.args[0] for invocation in popen.call_args_list],
             [["waybar"], ["waybar"]],
         )
+
+    @patch("workspace_icon_daemon.platform.subprocess.run")
+    def test_font_install_replaces_existing_file_atomically(self, run) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "generated.ttf"
+            source.write_bytes(b"new font")
+            fonts_dir = root / "fonts"
+            fonts_dir.mkdir()
+            destination = fonts_dir / source.name
+            destination.write_bytes(b"old font")
+            old_inode = destination.stat().st_ino
+
+            FontInstaller(Bar.NONE, fonts_dir).install(source)
+
+            self.assertEqual(destination.read_bytes(), b"new font")
+            self.assertNotEqual(destination.stat().st_ino, old_inode)

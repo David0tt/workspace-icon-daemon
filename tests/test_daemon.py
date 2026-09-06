@@ -37,8 +37,14 @@ class FakeWorkspace:
 
 
 class FakeConnection:
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
     def get_tree(self) -> object:
         return SimpleNamespace(workspaces=lambda: [FakeWorkspace()])
+
+    def command(self, command: str) -> None:
+        self.commands.append(command)
 
 
 class DaemonTests(TestCase):
@@ -106,6 +112,80 @@ class DaemonTests(TestCase):
         self.assertEqual(daemon._construct_workspace_name(2, ["a₂", "b"]), "2: a₂b")
 
     def test_new_cli_identity_and_platform_options(self) -> None:
-        args = parse_arguments(["--compositor", "sway", "--bar", "none"])
+        args = parse_arguments(
+            [
+                "--compositor",
+                "sway",
+                "--bar",
+                "none",
+                "--titlebar-icons",
+            ]
+        )
         self.assertEqual(args.compositor, "sway")
         self.assertEqual(args.bar, "none")
+        self.assertTrue(args.workspace_icons)
+        self.assertTrue(args.titlebar_icons)
+
+    def test_icon_outputs_default_to_both_enabled(self) -> None:
+        args = parse_arguments([])
+        self.assertTrue(args.workspace_icons)
+        self.assertTrue(args.titlebar_icons)
+
+    def test_icon_outputs_can_be_disabled_independently(self) -> None:
+        workspace_args = parse_arguments(["--no-titlebar-icons"])
+        self.assertTrue(workspace_args.workspace_icons)
+        self.assertFalse(workspace_args.titlebar_icons)
+
+        titlebar_args = parse_arguments(["--no-workspace-icons"])
+        self.assertFalse(titlebar_args.workspace_icons)
+        self.assertTrue(titlebar_args.titlebar_icons)
+
+        neither_args = parse_arguments(
+            ["--no-workspace-icons", "--no-titlebar-icons"]
+        )
+        self.assertFalse(neither_args.workspace_icons)
+        self.assertFalse(neither_args.titlebar_icons)
+
+    def test_workspace_icons_can_be_disabled(self) -> None:
+        daemon = object.__new__(WorkspaceIconDaemon)
+        daemon.workspace_icons = False
+        daemon.update_workspace_names()
+
+    def test_titlebar_icons_use_scoped_font_and_mapped_codepoint(self) -> None:
+        connection = FakeConnection()
+        windows = [
+            SimpleNamespace(id=41, app_id="foot", window_class=None),
+            SimpleNamespace(id=42, app_id=None, window_class="Firefox"),
+            SimpleNamespace(id=43, app_id="unmapped", window_class=None),
+        ]
+        connection.get_tree = lambda: SimpleNamespace(leaves=lambda: windows)
+        daemon = object.__new__(WorkspaceIconDaemon)
+        daemon.connection = connection
+        daemon.compositor = Compositor.SWAY
+        daemon.font_family_name = "WorkspaceIconDaemon"
+        daemon.titlebar_icons = True
+        daemon._titlebar_icon_codepoints = {}
+        codepoints = {"foot": 0xE000, "Firefox": 0xE001}
+        daemon.program_icon_map = SimpleNamespace(
+            get_unicode_id=lambda program: codepoints.get(program)
+        )
+
+        daemon.update_window_titles()
+
+        self.assertEqual(
+            connection.commands,
+            [
+                "[con_id=41] title_format \""
+                "<span font_family='WorkspaceIconDaemon'>&#xE000;</span> %title\"",
+                "[con_id=42] title_format \""
+                "<span font_family='WorkspaceIconDaemon'>&#xE001;</span> %title\"",
+            ],
+        )
+
+        daemon.update_window_titles()
+        self.assertEqual(len(connection.commands), 2)
+
+    def test_titlebar_icons_are_opt_in(self) -> None:
+        daemon = object.__new__(WorkspaceIconDaemon)
+        daemon.titlebar_icons = False
+        daemon.update_window_titles()

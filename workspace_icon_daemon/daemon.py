@@ -9,6 +9,7 @@ rebuilt and installed.
 from __future__ import annotations
 
 import argparse
+import html
 import logging
 import os
 import signal
@@ -396,6 +397,8 @@ class WorkspaceIconDaemon:
         font_family_name: str = DEFAULT_FONT_FAMILY_NAME,
         unique_icons_mode: UniqueIconsMode = UniqueIconsMode.NUMBERS_SUBSCRIPT,
         use_placeholder_icon: bool = True,
+        workspace_icons: bool = True,
+        titlebar_icons: bool = False,
     ) -> None:
         """Initialize the workspace icon daemon.
 
@@ -411,6 +414,9 @@ class WorkspaceIconDaemon:
             use_placeholder_icon: If True (default), use a placeholder icon for
                 programs without icons. If False, programs without icons are
                 tracked but don't get Unicode IDs.
+            workspace_icons: Add generated icons to workspace names.
+            titlebar_icons: Add each application's generated icon to its window
+                title using the compositor's title_format command.
         """
         self.connection = connection
         self.compositor = compositor
@@ -421,6 +427,9 @@ class WorkspaceIconDaemon:
         self.font_family_name: str = font_family_name
         self.unique_icons_mode: UniqueIconsMode = unique_icons_mode
         self.use_placeholder_icon: bool = use_placeholder_icon
+        self.workspace_icons: bool = workspace_icons
+        self.titlebar_icons: bool = titlebar_icons
+        self._titlebar_icon_codepoints: dict[int, int] = {}
 
     @staticmethod
     def _sort_windows_by_layout(windows: list[i3ipc.Con]) -> list[i3ipc.Con]:
@@ -957,6 +966,9 @@ class WorkspaceIconDaemon:
         Iterates through all workspaces, generates icon strings from running
         applications, and updates workspace names accordingly.
         """
+        if not self.workspace_icons:
+            return
+
         workspaces_info = self.get_programs_by_workspace(
             self.connection, self.compositor, self.IGNORED_PROGRAMS
         )
@@ -976,6 +988,59 @@ class WorkspaceIconDaemon:
 
             if new_name != ws_info.name:
                 self.rename_workspace(self.connection, ws_info.name, new_name)
+
+    def update_window_titles(self) -> None:
+        """Apply the mapped application icon to every window title.
+
+        The generated font contains only icon glyphs, so the font family is
+        scoped to the icon span. The ordinary ``%title`` text continues to use
+        Sway/i3's configured title font.
+        """
+        if not self.titlebar_icons:
+            return
+
+        family = html.escape(self.font_family_name, quote=True)
+        visible_container_ids: set[int] = set()
+        for window in self.connection.get_tree().leaves():
+            program = self._get_window_name(window, self.compositor)
+            unicode_id = (
+                self.program_icon_map.get_unicode_id(program) if program else None
+            )
+            container_id = getattr(window, "id", None)
+            if unicode_id is None or not isinstance(container_id, int):
+                continue
+            visible_container_ids.add(container_id)
+            if self._titlebar_icon_codepoints.get(container_id) == unicode_id:
+                continue
+
+            title_format = (
+                f"<span font_family='{family}'>&#x{unicode_id:X};</span> %title"
+            )
+            # Record this before sending the command: changing title_format may
+            # itself cause a window::title event on some compositor versions.
+            self._titlebar_icon_codepoints[container_id] = unicode_id
+            self.connection.command(
+                f'[con_id={container_id}] title_format "{title_format}"'
+            )
+
+        self._titlebar_icon_codepoints = {
+            container_id: unicode_id
+            for container_id, unicode_id in self._titlebar_icon_codepoints.items()
+            if container_id in visible_container_ids
+        }
+
+    def reset_window_titles(self) -> None:
+        """Restore the default title format on windows managed by the daemon."""
+        if not self.titlebar_icons:
+            return
+
+        for window in self.connection.get_tree().leaves():
+            container_id = getattr(window, "id", None)
+            if isinstance(container_id, int):
+                self.connection.command(
+                    f'[con_id={container_id}] title_format "%title"'
+                )
+        self._titlebar_icon_codepoints.clear()
 
     def _process_icons(self, icons: list[str]) -> list[str]:
         """Process icons based on the unique_icons_mode.
@@ -1058,15 +1123,19 @@ class WorkspaceIconDaemon:
             if self.process_new_programs():
                 self.install_icon_font()
             self.update_workspace_names()
+            self.update_window_titles()
 
     def on_exit(self) -> None:
         """Clean up workspace names and exit gracefully."""
         logger.debug("Cleaning up workspace names...")
 
-        for workspace in self.connection.get_tree().workspaces():
-            new_name = self._construct_workspace_name(workspace.num, [])
-            if new_name != workspace.name:
-                self.rename_workspace(self.connection, workspace.name, new_name)
+        self.reset_window_titles()
+
+        if self.workspace_icons:
+            for workspace in self.connection.get_tree().workspaces():
+                new_name = self._construct_workspace_name(workspace.num, [])
+                if new_name != workspace.name:
+                    self.rename_workspace(self.connection, workspace.name, new_name)
 
         self.connection.main_quit()
         sys.exit(0)
@@ -1124,6 +1193,7 @@ class WorkspaceIconDaemon:
         self.ensure_startup_font()
 
         self.update_workspace_names()
+        self.update_window_titles()
 
         for event in (
             "window::new",
@@ -1276,6 +1346,24 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--workspace-icons",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Add generated application icons to workspace names "
+            "(default: enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--titlebar-icons",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Add generated application icons to window titlebars. Pango markup "
+            "must be enabled for the compositor title font (default: enabled)."
+        ),
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help=(
@@ -1340,6 +1428,8 @@ def main() -> None:
         font_family_name=args.font_family_name,
         unique_icons_mode=UniqueIconsMode(args.unique_icons),
         use_placeholder_icon=not args.no_placeholder_icon,
+        workspace_icons=args.workspace_icons,
+        titlebar_icons=args.titlebar_icons,
     )
 
     # Rebuild icon map and font if requested

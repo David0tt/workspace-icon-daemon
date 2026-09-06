@@ -7,8 +7,8 @@
 [TODO: example swaybar image]
 *Example: swaybar showing workspaces with icons for currently running programs*
 
-
-Dynamically show running application icons in workspace names on **Sway and i3**.
+Dynamically show running application icons in workspace names and window
+titlebars on **Sway and i3**.
 
 The daemon finds system application icons, builds a color icon font, and updates
 workspace names when windows open, close or move to different workspaces.
@@ -19,6 +19,8 @@ Minor modifications may be needed when using a bar different from i3bar or swayb
 
 
 ## Features
+- Put program icons into the workspaces on the bar
+- Put program icons into the window titlebars
 - Automatically detects and displays the correct icon for any program.
 - Automatically detects i3 or Sway, with an explicit override when needed.
 - Supports i3bar, Waybar, or no automatic bar restart. 
@@ -62,6 +64,9 @@ Use `WorkspaceIconDaemon` as the bar font.
 For i3, edit the i3 config:
 
 ```i3config
+# Pango markup is required for the default titlebar icons.
+font pango:monospace 10
+
 bar {
     font WorkspaceIconDaemon 20
     height 30
@@ -81,8 +86,18 @@ For Sway with Waybar, add the font to `~/.config/waybar/style.css`:
 Then add this to the Sway config:
 
 ```swayconfig
+font pango:monospace 18
+
 exec_always ~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon
 ```
+
+Both workspace and titlebar icons are enabled by default. You can deactivate either with the `--no-workspace-icons` and `--no-titlebar-icons` flags.
+
+The daemon applies a per-window `title_format` such as
+`<span font_family='WorkspaceIconDaemon'>ICON</span> %title`. The generated
+font is used only for the icon; normal title text continues to use the font
+configured in Sway. A normal titlebar must be enabled for the icon to be
+visible. 
 
 Automatic detection chooses i3bar for i3 and Waybar for Sway. Override either decision when necessary:
 
@@ -108,14 +123,16 @@ bindsym $mod+Shift+2 move container to workspace number 2
 ## Options
 The most important options you might want to use. Use `--help` for a full list.
 ```bash
-workspace-icon-daemon --help                                # Show all options
-workspace-icon-daemon --unique-icons                        # Display mode: nonunique | unique | numbers_subscript | numbers_superscript
-workspace-icon-daemon --no-placeholder-icon                 # Don't use placeholder icons when program icons are not found
-workspace-icon-daemon --compositor {auto,i3,sway}           # Explicitly specify the compositor
-workspace-icon-daemon --bar {auto,i3bar,waybar,none}        # Explicitly specify the bar
-workspace-icon-daemon --rebuild                             # rediscover icons and rebuild the font from the saved icon map
-workspace-icon-daemon --full-rebuild                        # delete the icon map and cached font, then rediscover and rebuild
-workspace-icon-daemon --verbose                             # Enable debug output
+workspace-icon-daemon --help                               # Show all options
+workspace-icon-daemon --no-titlebar-icons                  # Don't put icons into the titlebars
+workspace-icon-daemon --no-workspace-icons                 # Don't put icons into the workspaces
+workspace-icon-daemon --unique-icons                       # # Display mode: nonunique | unique | numbers_subscript | numbers_superscript
+workspace-icon-daemon --no-placeholder-icon                # Don't use placeholder icons when program icons are not found
+workspace-icon-daemon --compositor {auto,i3,sway}          # Explicitly specify the compositor
+workspace-icon-daemon --bar {auto,i3bar,waybar,none}       # Explicitly specify the bar
+workspace-icon-daemon --rebuild                            # rediscover icons and rebuild the font from the saved icon map
+workspace-icon-daemon --full-rebuild                       # delete the icon map and cached font, then rediscover and rebuild
+workspace-icon-daemon --verbose                            # Enable debug output
 ``` 
 
 The persistent paths are:
@@ -167,6 +184,7 @@ Since most bars cannot display images directly, this daemon creates a custom fon
 - [ ] Better icon spacing when using count indicators
 - [ ] support for different bars. In theory, this works, with any bar that shows workspaces by their title, and where you can set the font (and that has a reasonable font rendering support, e.g. for emojis). However, the updating sequence needs to be modified, depending on the bar. 
 - [ ] graceful restart currently does not work: If you add the workspace-icon-daemon to your config with exec_always, this could lead to multiple daemon processes being created, whenever you reload the window manager. Further, the daemon closes and starts the bar, thereby taking ownership of this child process, so on window manager reload a second bar is started. To the best of my knowledge everything works when the whole system is restarted, but of course this could be improved. 
+- [ ] In general, sway is tested much better than i3, since it is my daily driver. If you come across any bugs on i3, please open an issue.
 
 
 ## Inspiration

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -100,7 +102,18 @@ class FontInstaller:
                 stderr=devnull,
             )
 
-        shutil.copy2(source, destination)
+        # Do not truncate a font file while a renderer may have it mmap'ed.
+        # Publish a fully written replacement as a new inode instead.
+        temporary_fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{source.name}.", dir=self.fonts_dir
+        )
+        os.close(temporary_fd)
+        temporary_path = Path(temporary_name)
+        try:
+            shutil.copy2(source, temporary_path)
+            os.replace(temporary_path, destination)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
         # Restart the bar immediately so the slow font-cache refresh does not
         # leave it unavailable.
