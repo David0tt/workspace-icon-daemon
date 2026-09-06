@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from PIL import Image
 
@@ -12,6 +12,7 @@ from workspace_icon_daemon.daemon import (
     PLACEHOLDER_CODEPOINT,
     ProgramIconMap,
     WorkspaceIconDaemon,
+    main,
 )
 from workspace_icon_daemon.platform import Compositor, FontInstaller
 
@@ -178,3 +179,43 @@ class StartupTests(TestCase):
             icon_index = self.daemon._installed_icon_index()
 
         self.assertEqual(icon_index["example"], directories[128] / "example.png")
+
+    def test_normal_startup_stops_previous_daemon_before_writing_pid(self) -> None:
+        args = SimpleNamespace(
+            compositor="sway",
+            program_icon_map=self.root / "map.yaml",
+            base_font=DEFAULT_BASE_FONT_PATH,
+            font_output=self.root / "cached.ttf",
+            font_family_name="WorkspaceIconDaemon",
+            unique_icons="numbers_subscript",
+            no_placeholder_icon=False,
+            workspace_icons=True,
+            titlebar_icons=True,
+            reset=False,
+            reset_and_rebuild=False,
+            verbose=False,
+        )
+        calls = Mock()
+        daemon = Mock()
+        daemon.font_installer.fonts_dir = self.root / "fonts"
+
+        with patch(
+            "workspace_icon_daemon.daemon.parse_arguments", return_value=args
+        ), patch("workspace_icon_daemon.daemon.i3ipc.Connection"), patch(
+            "workspace_icon_daemon.daemon.WorkspaceIconDaemon", return_value=daemon
+        ), patch(
+            "workspace_icon_daemon.daemon.signal.signal"
+        ), patch(
+            "workspace_icon_daemon.daemon.stop_running_daemon",
+            wraps=lambda path: calls.stop(path),
+        ), patch(
+            "workspace_icon_daemon.daemon.write_pid_file",
+            wraps=lambda path: calls.write(path),
+        ), patch(
+            "workspace_icon_daemon.daemon.remove_own_pid_file"
+        ):
+            main()
+
+        pid_path = args.font_output.parent / "daemon.pid"
+        self.assertEqual(calls.mock_calls, [call.stop(pid_path), call.write(pid_path)])
+        daemon.run.assert_called_once_with()

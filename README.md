@@ -246,7 +246,7 @@ You can use `font-manager MyIconFont.ttf` to inspect the generated font and you 
 - [ ] Better icon spacing when using count indicators
 - [ ] support for different bars. In theory, this works, with any bar that shows workspaces by their title, and where you can set the font (and that has a reasonable font rendering support, e.g. for emojis). However, the updating sequence needs to be modified, depending on the bar. 
 - [ ] In general, sway is tested much better than i3, since it is my daily driver. If you come across any bugs on i3, please open an issue.
-- [ ] The unicode PUA (private use area) used contains 137,468 code points, so if you have more than this amount of applications on your system installed, this could be an issue.
+- [ ] The unicode PUA (private use area) used contains 6,399 code points, so if you have more than this amount of applications on your system installed, this could be an issue.
 
 ## Inspiration
 

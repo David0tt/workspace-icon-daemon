@@ -1114,10 +1114,8 @@ class WorkspaceIconDaemon:
         self.install_icon_font()
         if new_application:
             self.notify(
-                "New application icon installed",
-                "A new application was detected and its icon font was updated. "
-                "Restart the compositor by logging out and back in to display "
-                "the new icon correctly.",
+                "WorkspaceIconDaemon: New application icon installed",
+                "Log out and back in again for the new application icon to be correctly shown",
             )
 
     def _active_unicode_id(self, program: str) -> int | None:
@@ -1377,10 +1375,8 @@ class WorkspaceIconDaemon:
             logger.info("No usable preinstalled icon font; creating one for next login")
             self._publish_font_update(new_application=False)
             self.notify(
-                "Icon font installed",
-                "The application icon font has been created. Restart the compositor "
-                "by logging out and back in; the workspace icon daemon will start "
-                "normally then.",
+                "WorkspaceIconDaemon: Icon font installed",
+                "Log out and back in again to show application icons"
             )
             return False
 
@@ -1662,10 +1658,8 @@ def main() -> None:
             daemon._add_running_programs()
             daemon._publish_font_update(new_application=False)
             daemon.notify(
-                "Icon font rebuilt",
-                "The application icon font was reset and rebuilt. Restart the "
-                "compositor by logging out and back in; the daemon can start "
-                "normally next time.",
+                "WorkspaceIconDaemon: Icon font rebuilt",
+                "Log out and back in again to show application icons",
             )
         return
 
@@ -1676,6 +1670,11 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, signal_handler)
 
+    # ``exec_always`` starts this command again whenever the compositor config
+    # is reloaded.  Reuse the reset path's PID/start-time-aware shutdown so the
+    # replacement does not leave multiple event loops managing the same
+    # workspaces and title formats.
+    stop_running_daemon(pid_path)
     write_pid_file(pid_path)
     try:
         daemon.run()
