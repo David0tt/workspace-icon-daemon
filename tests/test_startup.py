@@ -1,17 +1,19 @@
-import os
 import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from fontTools.ttLib import TTFont
 from PIL import Image
 
 from workspace_icon_daemon.daemon import (
-    DEFAULT_BASE_FONT_PATH, ProgramIconEntry, ProgramIconMap, WorkspaceIconDaemon,
+    DEFAULT_BASE_FONT_PATH,
+    PLACEHOLDER_CODEPOINT,
+    ProgramIconMap,
+    WorkspaceIconDaemon,
 )
-from workspace_icon_daemon.platform import Bar, Compositor, FontInstaller
+from workspace_icon_daemon.platform import Compositor, FontInstaller
 
 
 class StartupTests(TestCase):
@@ -26,107 +28,153 @@ class StartupTests(TestCase):
         mapping.save()
         self.connection = Mock()
         self.connection.get_tree.return_value.workspaces.return_value = []
+        self.connection.get_tree.return_value.leaves.return_value = []
         self.daemon = WorkspaceIconDaemon(
-            self.connection, Compositor.SWAY,
-            FontInstaller(Bar.NONE, self.root / "fonts"),
+            self.connection,
+            Compositor.SWAY,
+            FontInstaller(self.root / "fonts"),
             program_icon_map_path=mapping.filepath,
             font_output_path=self.root / "cached.ttf",
         )
         self.daemon.create_icon_font(
-            mapping, DEFAULT_BASE_FONT_PATH, self.daemon.font_output_path,
+            mapping,
+            DEFAULT_BASE_FONT_PATH,
+            self.daemon.font_output_path,
             self.daemon.font_family_name,
         )
         self.destination = self.root / "fonts" / "cached.ttf"
         self.destination.parent.mkdir()
         shutil.copy2(self.daemon.font_output_path, self.destination)
 
-    def recover(self, rebuild: bool, install: bool = True) -> None:
+    def test_second_startup_uses_preinstalled_font_without_rebuilding(self) -> None:
         with patch.object(
-            self.daemon, "create_icon_font", wraps=self.daemon.create_icon_font,
-        ) as build, patch("workspace_icon_daemon.platform.subprocess.run") as run:
+            self.daemon, "discover_installed_programs", return_value=False
+        ), patch.object(self.daemon, "create_icon_font") as build, patch.object(
+            self.daemon, "install_icon_font"
+        ) as install:
             self.daemon.run()
-        self.assertEqual(build.call_count, int(rebuild))
-        self.assertEqual(run.call_count, int(install))
-        self.assertEqual(self.destination.read_bytes(), self.daemon.font_output_path.read_bytes())
+
+        build.assert_not_called()
+        install.assert_not_called()
         self.connection.main.assert_called_once()
+        self.assertEqual(self.daemon._active_unicode_id("app"), 0xE001)
 
-    def test_unchanged_startup_does_no_font_work(self) -> None:
-        self.recover(False, False)
-
-    def test_missing_cache_is_rebuilt(self) -> None:
-        self.daemon.font_output_path.unlink()
-        self.recover(True)
-
-    def test_missing_install_is_restored_without_rebuild(self) -> None:
+    def test_first_startup_builds_notifies_and_exits_without_renaming(self) -> None:
         self.destination.unlink()
-        self.recover(False)
+        with patch.object(
+            self.daemon, "discover_installed_programs", return_value=False
+        ), patch.object(self.daemon, "install_icon_font") as install, patch.object(
+            self.daemon, "notify"
+        ) as notify:
+            self.daemon.run()
 
-    def test_different_installed_bytes_are_replaced(self) -> None:
-        self.destination.write_bytes(b"stale")
-        self.recover(False)
+        install.assert_called_once()
+        notify.assert_called_once()
+        self.connection.main.assert_not_called()
+        self.connection.command.assert_not_called()
 
-    def test_corrupt_cache_is_rebuilt(self) -> None:
-        self.daemon.font_output_path.write_bytes(b"broken font")
-        self.recover(True)
+    def test_new_program_is_installed_but_uses_loaded_placeholder(self) -> None:
+        with patch.object(
+            self.daemon, "discover_installed_programs", return_value=False
+        ):
+            self.assertTrue(self.daemon.ensure_startup_font())
 
-    def test_changed_inputs_trigger_rebuild(self) -> None:
-        for source in (self.icon, self.daemon.program_icon_map.filepath):
-            with self.subTest(source=source):
-                timestamp = self.daemon.font_output_path.stat().st_mtime_ns + 1
-                os.utime(source, ns=(timestamp, timestamp))
-                self.connection.main.reset_mock()
-                self.recover(True)
-
-    def test_changed_family_triggers_rebuild(self) -> None:
-        self.daemon.font_family_name = "DifferentFamily"
-        self.recover(True)
-        with TTFont(self.destination) as font:
-            self.assertEqual(font["name"].getDebugName(1), "DifferentFamily")
-
-    def test_mapping_mismatch_is_detected_without_newer_timestamp(self) -> None:
-        mapping = self.daemon.program_icon_map
-        mapping.programs["app"] = ProgramIconEntry(self.icon, 0xE005)
-        mapping.save()
-        timestamp = self.daemon.font_output_path.stat().st_mtime_ns
-        os.utime(mapping.filepath, ns=(timestamp, timestamp))
-        self.recover(True)
-        with TTFont(self.destination) as font:
-            self.assertIn(0xE005, font.getBestCmap())
-            self.assertNotIn(0xE000, font.getBestCmap())
-
-    def test_new_program_is_built_only_once(self) -> None:
-        workspace = Mock()
-        workspace.num = 1
-        workspace.name = "1"
-        window = Mock()
-        window.app_id = "new-app"
-        window.rect.x = window.rect.y = 0
+        workspace = Mock(num=1, name="1")
+        window = SimpleNamespace(
+            id=42,
+            app_id="new-app",
+            window_class=None,
+            rect=SimpleNamespace(x=0, y=0),
+        )
         workspace.leaves.return_value = [window]
         self.connection.get_tree.return_value.workspaces.return_value = [workspace]
-        with patch.object(self.daemon, "find_icon_for_program", return_value=self.icon):
-            self.recover(True)
+        self.connection.get_tree.return_value.leaves.return_value = [window]
 
-    def test_map_cleanup_rebuilds_before_install(self) -> None:
-        removed = self.root / "removed.png"
-        shutil.copy2(self.icon, removed)
-        mapping = self.daemon.program_icon_map
-        mapping.add_program("removed", removed)
-        mapping.save()
-        self.daemon.create_icon_font(
-            mapping, DEFAULT_BASE_FONT_PATH, self.daemon.font_output_path,
-            self.daemon.font_family_name,
+        with patch.object(
+            self.daemon, "find_icon_for_program", return_value=self.icon
+        ), patch.object(self.daemon, "install_icon_font") as install, patch.object(
+            self.daemon, "notify"
+        ) as notify:
+            self.daemon.on_window_event(
+                self.connection, SimpleNamespace(change="new")
+            )
+
+        install.assert_called_once()
+        notify.assert_called_once()
+        self.assertEqual(
+            self.daemon._active_unicode_id("new-app"), PLACEHOLDER_CODEPOINT
         )
-        removed.unlink()
-        self.daemon.program_icon_map = ProgramIconMap(mapping.filepath)
-        self.recover(True)
-        with TTFont(self.destination) as font:
-            self.assertNotIn(0xE001, font.getBestCmap())
+        self.assertNotEqual(
+            self.daemon.program_icon_map.get_unicode_id("new-app"),
+            PLACEHOLDER_CODEPOINT,
+        )
 
-    def test_empty_map_needs_no_font(self) -> None:
-        self.daemon.program_icon_map.programs.clear()
-        self.daemon.program_icon_map.save()
-        self.daemon.font_output_path.unlink()
-        with patch.object(self.daemon, "install_icon_font") as install:
-            self.daemon.run()
-        install.assert_not_called()
-        self.assertFalse(self.daemon.font_output_path.exists())
+    def test_installed_desktop_entries_and_startup_class_are_prebuilt(self) -> None:
+        applications = self.root / "applications"
+        applications.mkdir()
+        desktop = applications / "org.example.App.desktop"
+        desktop.write_text(
+            "[Desktop Entry]\nIcon=example\nStartupWMClass=ExampleClass\n",
+            encoding="utf-8",
+        )
+        empty_map = ProgramIconMap(self.root / "desktop-map.yaml")
+        self.daemon.program_icon_map = empty_map
+
+        with patch.object(
+            self.daemon, "_desktop_application_paths", return_value=[applications]
+        ), patch.object(
+            self.daemon, "_installed_icon_index", return_value={"example": self.icon}
+        ):
+            self.assertTrue(self.daemon.discover_installed_programs())
+
+        self.assertIsNotNone(empty_map.get_unicode_id("org.example.App"))
+        self.assertIsNotNone(empty_map.get_unicode_id("ExampleClass"))
+
+    def test_bulk_index_preserves_old_application_icon_precedence(self) -> None:
+        preferred_svg = self.root / "hicolor" / "scalable" / "apps"
+        preferred_png = self.root / "hicolor" / "128x128" / "apps"
+        fallback = self.root / "char-white" / "apps" / "16"
+        for directory in (preferred_svg, preferred_png, fallback):
+            directory.mkdir(parents=True)
+
+        color_png = preferred_png / "example.png"
+        color_png.write_bytes(b"color")
+        monochrome_svg = fallback / "example.svg"
+        monochrome_svg.write_text("<svg/>", encoding="utf-8")
+
+        def preferred(extension: str) -> list[Path]:
+            return [preferred_svg] if extension == "svg" else [preferred_png]
+
+        with patch.object(
+            WorkspaceIconDaemon,
+            "_preferred_icon_search_paths",
+            side_effect=preferred,
+        ), patch.object(
+            WorkspaceIconDaemon, "_icon_search_roots", return_value=[fallback]
+        ):
+            icon_index = self.daemon._installed_icon_index()
+
+        self.assertEqual(icon_index["example"], color_png)
+
+    def test_png_precedence_prefers_128_over_larger_and_smaller_icons(self) -> None:
+        directories = {
+            size: self.root / "hicolor" / f"{size}x{size}" / "apps"
+            for size in (16, 128, 512)
+        }
+        for size, directory in directories.items():
+            directory.mkdir(parents=True)
+            (directory / "example.png").write_bytes(str(size).encode())
+
+        ordered = [directories[size] for size in (128, 512, 16)]
+
+        def preferred(extension: str) -> list[Path]:
+            return [] if extension == "svg" else ordered
+
+        with patch.object(
+            WorkspaceIconDaemon,
+            "_preferred_icon_search_paths",
+            side_effect=preferred,
+        ), patch.object(WorkspaceIconDaemon, "_icon_search_roots", return_value=[]):
+            icon_index = self.daemon._installed_icon_index()
+
+        self.assertEqual(icon_index["example"], directories[128] / "example.png")

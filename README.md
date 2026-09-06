@@ -10,12 +10,12 @@
 Dynamically show running application icons in workspace names and window
 titlebars on **Sway and i3**.
 
-The daemon finds system application icons, builds a color icon font, and updates
-workspace names when windows open, close or move to different workspaces.
+The daemon discovers all installed desktop applications, builds a color icon font,
+and dynamically updates workspace names and application titles when windows open, close or move.
 
 This approach should work on almost any bar that has font rendering capabilities. i3bar and waybar are explicitly tested. Crucially, this does not require image rendering capabilities by the bar, since a font with the appropriate program icons is created on the fly. 
 
-Minor modifications may be needed when using a bar different from i3bar or swaybar, to correctly restart the bar. This is required, since whenever a compeletely new program is opened, the icon font is recreated with this additional icon and a reload of the bar is required afterwards. 
+To use newly generated icon fonts, the bar or compositor needs to be restarted once by logging out and back in again.
 
 
 ## Features
@@ -23,24 +23,24 @@ Minor modifications may be needed when using a bar different from i3bar or swayb
 - Put program icons into the window titlebars
 - Automatically detects and displays the correct icon for any program.
 - Automatically detects i3 or Sway, with an explicit override when needed.
-- Supports i3bar, Waybar, or no automatic bar restart. 
+- Explicitly supports i3bar and Waybar, however other bars with (pango) font rendering support should also work
 - Supports program count indicators as sub-/superscripts when multiple instances of the same program are running.
 
 ## Installation
 
 Workspace Icon Daemon requires Python 3.10 or newer, pip, Python's `venv`
-module, Fontconfig, Cairo, and procps (`pgrep`/`pkill`).
+module, Fontconfig, Cairo, and `notify-send` for desktop notifications.
 
 On Debian or Ubuntu, install them with:
 
 ```sh
-sudo apt install python3 python3-pip python3-venv fontconfig libcairo2 procps
+sudo apt install python3 python3-pip python3-venv fontconfig libcairo2 libnotify-bin
 ```
 
 On Arch Linux, install them with:
 
 ```sh
-sudo pacman -S python python-pip fontconfig cairo procps-ng
+sudo pacman -S python python-pip fontconfig cairo libnotify
 ```
 
 Clone the repository, create a dedicated virtual environment, and install the
@@ -99,14 +99,23 @@ font is used only for the icon; normal title text continues to use the font
 configured in Sway. A normal titlebar must be enabled for the icon to be
 visible. 
 
-Automatic detection chooses i3bar for i3 and Waybar for Sway. Override either decision when necessary:
+Override compositor detection when necessary:
 
 ```sh
-~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway --bar none
-~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway --bar i3bar
+~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor sway
+~/.local/share/workspace-icon-daemon/venv/bin/workspace-icon-daemon --compositor i3
 ```
 
-`--bar none` installs and refreshes the font cache without managing a bar process.
+### First start and newly installed applications
+
+On the first start, the daemon scans all XDG desktop entries, builds and installs
+the font, sends a desktop notification, and exits without renaming anything.
+Log out and back in once; the second start enters the normal monitoring loop.
+
+When an application not present in the session's loaded font is discovered (e.g.
+after installing a new program), the daemon installs an updated font for the next
+login and sends a notification. It continues running and displays the reserved
+placeholder glyph for that application in the current session.
 
 
 On either window manager, use workspace **numbers** for switching and moving
@@ -129,9 +138,8 @@ workspace-icon-daemon --no-workspace-icons                 # Don't put icons int
 workspace-icon-daemon --unique-icons                       # # Display mode: nonunique | unique | numbers_subscript | numbers_superscript
 workspace-icon-daemon --no-placeholder-icon                # Don't use placeholder icons when program icons are not found
 workspace-icon-daemon --compositor {auto,i3,sway}          # Explicitly specify the compositor
-workspace-icon-daemon --bar {auto,i3bar,waybar,none}       # Explicitly specify the bar
-workspace-icon-daemon --rebuild                            # rediscover icons and rebuild the font from the saved icon map
-workspace-icon-daemon --full-rebuild                       # delete the icon map and cached font, then rediscover and rebuild
+workspace-icon-daemon --reset                              # stop daemon, restore workspace and title names, remove state, and exit
+workspace-icon-daemon --reset-and-rebuild                  # reset, prebuild/install the font, and exit
 workspace-icon-daemon --verbose                            # Enable debug output
 ``` 
 
@@ -140,6 +148,7 @@ The persistent paths are:
 - `$XDG_CONFIG_HOME/workspace-icon-daemon/program_icon_map.yaml`
 - `$XDG_CACHE_HOME/workspace-icon-daemon/WorkspaceIconDaemon.ttf`
 - `$XDG_DATA_HOME/fonts/WorkspaceIconDaemon.ttf`
+- `$XDG_CACHE_HOME/workspace-icon-daemon/daemon.pid`
 
 The usual XDG defaults apply when those environment variables are unset.
 
@@ -155,7 +164,8 @@ python -m unittest discover
 
 ## Limitations
 
-- When opening new programs, bar restarts can cause brief flicker. This is required, since the font may not be changed while the bar is using it. For simultaneous sessions, custom bar launch arguments, or bars supervised by systemd, use `--bar none` and arrange font reloads through your bar manager.
+- Newly installed application icons require a logout/login before they replace
+  the placeholder glyph. 
 - Numbers indicating program counts use subscripts/superscripts, which disrupt equal spacing between icons. A better solution might use Unicode diacritics or embed numbers directly in icons, but this has not been implemented yet. 
 - This system is relatively hacky. If you want something simpler, you can use the default approach of mapping programs to nerdfont symbols used by many other setups. 
 
@@ -163,19 +173,71 @@ python -m unittest discover
 
 Since most bars cannot display images directly, this daemon creates a custom font from program icons on-the-fly:
 
-1. The daemon monitors window events (new, close, move) over i3 IPC
-2. When a new program is detected:
-   - Finds the program's `.desktop` file
-   - Extracts the `Icon=` entry to locate the icon file in standard system directories
-   - Assigns the program a Unicode codepoint in the Private Use Area (PUA)
-   - Rebuilds the custom color bitmap font with all known icons when a previously unseen application appears
-   - Stops bar (to prevent crashes when modifying the active font)
-   - Installs the font
-   - Restarts bar
-   - Reloads the font cache with `fc-cache`
-   - Restarts bar again to load the updated cache
-3. Workspace names are updated with icon characters from the custom font whenever window events occur to values like `2: <icons>`
-4. A program-to-icon map is persisted for consistency and fast restarts. The font is only rebuilt when a completely new program is encountered
+1. At startup, the daemon discovers all installed programs and their icons.
+   1. It first scans desktop entries in XDG precedence order:
+      1. $XDG_DATA_HOME/applications
+      2. Each directory in $XDG_DATA_DIRS, normally:
+         - /usr/local/share/applications
+         - /usr/share/applications
+      3. /var/lib/snapd/desktop/applications
+   2. For each `.desktop` file, the daemon extracts the `Icon=`
+   and `StartupWMClass=` values.
+   3. Icon discsovery. Icons are found following the following precedence:
+      1. An absolute SVG or PNG path specified directly by `Icon=`.
+      2. SVG application icons, in order:
+         1. `hicolor/scalable/apps`
+         2. Humanity application-icon directories
+         3. `HighContrast/scalable/apps`
+         4. `/usr/share/pixmaps`
+      3. PNG application icons, in order:
+         1. `hicolor` application-icon directories going through the resolutions beginning at 124x124 (Note that the target font uses a strike of 109×109 pixels, so input resolutions closest to this are preferred)
+         2. `/usr/share/pixmaps`
+      4. Recursive SVG fallback search through:
+         1. `$XDG_DATA_HOME/icons`
+         2. `$XDG_DATA_HOME/pixmaps`
+         3. The corresponding `icons` and `pixmaps` directories under `$XDG_DATA_DIRS`
+      5. Recursive PNG fallback search through the same directories.
+      6. Note: The explicit application-ion directories are searched before recursive theme fallbacks. This prevents symbolic or monochrome theme icons from overriding full-color application icons in hicolor.
+2. It reserves U+E000 for the placeholder icon and assigns stable PUA (Private Use Area) 
+   Unicode  codepoints to discovered applications.
+3. The first run builds the custom icon font, atomically installs it, refreshes fontconfig,
+   notifies, and exits. No workspace or titlebar names are changed, since hot-swapping the
+   loaded fonts for running applications (compositor, bar) is not possible and a restart 
+   (logout/login) is required
+4. Later runs use the installed and loaded icon font and dynamically modify workspace 
+   names and titlebar names to show these icons, based on window events. 
+5. A newly discovered program (e.g. after a new installation) triggers a next-session 
+   font build and notification; in the current session the placeholder icon is used.
+
+## Using the font builder standalone
+
+The bundled font builder can also be used stand alone to create an icon font from PNG and SVG files
+
+```sh
+python -m workspace_icon_daemon.font_builder --help
+```
+
+The base font must be a bitmap color font containing CBDT and CBLC tables. The
+repository includes a suitable `NotoColorEmoji.ttf` base font. Font generation is generally very tricky, and I can not guarantee it working with other fonts. 
+
+### Building a font
+
+You can either put the desired PNG and SVG files into a directory, or build from an explicit list, using either the `--input-folder` or `--icon-paths` flag. Example
+
+```sh
+python -m workspace_icon_daemon.font_builder \
+    --icon-paths /usr/share/icons/hicolor/scalable/apps/firefox.svg /usr/share/icons/breeze/apps/16/utilities-terminal.svg \
+    --base-font ./workspace_icon_daemon/NotoColorEmoji.ttf \
+    --output ./MyIconFont.ttf \
+    --family-name MyIconFont \
+    --pua-start 0xE100 \
+    --remove-original-symbols
+```
+
+PNG images are resized to the base font's bitmap strike size when necessary (for NotoColorEmoji this is 109x109); SVG images are rasterized at that size. `--remove-original-symbols` removes the base font's existing emoji glyphs and produces an icon-only font. Omit it if you want to retain the original glyphs as well.
+
+You can use `font-manager MyIconFont.ttf` to inspect the generated font and you can use `fc-cache` to install it. If this does not work, you might want to use the font-viewer directly: `/usr/lib/font-manager/font-viewer MyIconFont.ttf`.
+
 
 
 ### Possible Future Features
@@ -183,9 +245,8 @@ Since most bars cannot display images directly, this daemon creates a custom fon
 - [ ] Limit maximum number of icons shown per workspace
 - [ ] Better icon spacing when using count indicators
 - [ ] support for different bars. In theory, this works, with any bar that shows workspaces by their title, and where you can set the font (and that has a reasonable font rendering support, e.g. for emojis). However, the updating sequence needs to be modified, depending on the bar. 
-- [ ] graceful restart currently does not work: If you add the workspace-icon-daemon to your config with exec_always, this could lead to multiple daemon processes being created, whenever you reload the window manager. Further, the daemon closes and starts the bar, thereby taking ownership of this child process, so on window manager reload a second bar is started. To the best of my knowledge everything works when the whole system is restarted, but of course this could be improved. 
 - [ ] In general, sway is tested much better than i3, since it is my daily driver. If you come across any bugs on i3, please open an issue.
-
+- [ ] The unicode PUA (private use area) used contains 137,468 code points, so if you have more than this amount of applications on your system installed, this could be an issue.
 
 ## Inspiration
 

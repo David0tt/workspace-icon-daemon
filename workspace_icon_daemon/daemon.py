@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Workspace icon daemon for i3 and Sway.
+"""Workspace and titlebar icons for i3 and Sway.
 
-Dynamically updates workspace names with icons by creating custom
-fonts on-the-fly. When new applications are detected, their icons are
-automatically discovered, added to a custom font file, and the font is
-rebuilt and installed.
+Creates custom icon font from all installed programs. After next restart those
+are automatically used to dynamically set workspace names and window titles
+on window events. 
 """
 from __future__ import annotations
 
@@ -13,7 +12,9 @@ import html
 import logging
 import os
 import signal
+import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -26,12 +27,10 @@ from fontTools.ttLib import TTFont
 
 from .font_builder import FontBuilder
 from .platform import (
-    Bar,
     Compositor,
     FontInstaller,
     detect_compositor,
     program_name,
-    resolve_bar,
 )
 
 
@@ -93,6 +92,7 @@ DEFAULT_PROGRAM_ICON_MAP_PATH = DEFAULT_CONFIG_DIR / "program_icon_map.yaml"
 
 # Generated font file (can be regenerated, so it's cache)
 DEFAULT_FONT_OUTPUT_PATH = DEFAULT_CACHE_DIR / "WorkspaceIconDaemon.ttf"
+DEFAULT_PID_PATH = DEFAULT_CACHE_DIR / "daemon.pid"
 
 # Read-only resource files bundled with the package
 DEFAULT_BASE_FONT_PATH = get_resource_path("NotoColorEmoji.ttf")
@@ -107,6 +107,8 @@ PROGRAM_NAME_CORRECTIONS = {
 # Other constants
 DEFAULT_FONT_FAMILY_NAME = "WorkspaceIconDaemon"
 PUA_START = 0xE000
+PLACEHOLDER_CODEPOINT = PUA_START
+PROGRAM_PUA_START = PUA_START + 1
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +164,7 @@ class ProgramIconMap:
         """
         self.filepath: Path = filepath
         self.programs: dict[str, ProgramIconEntry] = {}
-        self.next_unicode_id: int = PUA_START
+        self.next_unicode_id: int = PROGRAM_PUA_START
         self.modified_at_load: bool = False
 
         if not self.filepath.exists():
@@ -217,7 +219,9 @@ class ProgramIconMap:
                 e.unicode_id for e in self.programs.values() if e.icon_path is not None
             ]
             if valid_unicode_ids:
-                self.next_unicode_id = max(valid_unicode_ids) + 1
+                self.next_unicode_id = max(
+                    PROGRAM_PUA_START, max(valid_unicode_ids) + 1
+                )
 
         logger.debug("Loaded %d programs from %s", len(self.programs), self.filepath)
 
@@ -430,6 +434,10 @@ class WorkspaceIconDaemon:
         self.workspace_icons: bool = workspace_icons
         self.titlebar_icons: bool = titlebar_icons
         self._titlebar_icon_codepoints: dict[int, int] = {}
+        # This is intentionally a snapshot.  Installing a replacement font does
+        # not make its glyphs available to processes in the current session.
+        self._active_program_codepoints: dict[str, int] = {}
+        self._active_placeholder_available = False
 
     @staticmethod
     def _sort_windows_by_layout(windows: list[i3ipc.Con]) -> list[i3ipc.Con]:
@@ -598,12 +606,7 @@ class WorkspaceIconDaemon:
         Returns:
             Path to the .desktop file, or None if not found.
         """
-        search_paths = [
-            Path("/usr/share/applications"),
-            Path("/usr/local/share/applications"),
-            Path("/var/lib/snapd/desktop/applications"),
-            Path.home() / ".local/share/applications",
-        ]
+        search_paths = WorkspaceIconDaemon._desktop_application_paths()
 
         # 1. Exact match, case-sensitive
         for base in search_paths:
@@ -674,6 +677,11 @@ class WorkspaceIconDaemon:
         Returns:
             The icon name or path, or None if not found or on error.
         """
+        return WorkspaceIconDaemon._parse_desktop_value(desktop_path, "Icon")
+
+    @staticmethod
+    def _parse_desktop_value(desktop_path: Path, key: str) -> str | None:
+        """Extract a value from a desktop file's ``[Desktop Entry]`` section."""
         try:
             with open(desktop_path, encoding="utf-8") as f:
                 in_desktop_entry = False
@@ -686,11 +694,11 @@ class WorkspaceIconDaemon:
                         in_desktop_entry = line == "[Desktop Entry]"
                         continue
 
-                    if in_desktop_entry and line.startswith("Icon="):
+                    if in_desktop_entry and line.startswith(f"{key}="):
                         icon_value = line.split("=", 1)[1].strip()
                         return icon_value if icon_value else None
 
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             logger.debug("Failed to read desktop file %s: %s", desktop_path, exc)
 
         return None
@@ -706,8 +714,20 @@ class WorkspaceIconDaemon:
         Returns:
             Path to the icon file, or None if not found.
         """
+        for search_path in WorkspaceIconDaemon._preferred_icon_search_paths(
+            extension
+        ):
+            candidate = search_path / f"{icon_name}.{extension}"
+            if candidate.exists():
+                return candidate
+
+        return None
+
+    @staticmethod
+    def _preferred_icon_search_paths(extension: str) -> list[Path]:
+        """Return preferred application-icon directories in quality order."""
         if extension == "svg":
-            search_paths = [
+            return [
                 Path("/usr/share/icons/hicolor/scalable/apps"),
                 Path("/usr/share/icons/Humanity/apps/16"),
                 Path("/usr/share/icons/Humanity/apps/22"),
@@ -720,32 +740,27 @@ class WorkspaceIconDaemon:
                 Path("/usr/share/icons/HighContrast/scalable/apps"),
                 Path("/usr/share/pixmaps"),
             ]
-        elif extension == "png":  # png
-            search_paths = [
-                Path("/usr/share/icons/hicolor/16x16/apps"),
-                Path("/usr/share/icons/hicolor/22x22/apps"),
-                Path("/usr/share/icons/hicolor/24x24/apps"),
-                Path("/usr/share/icons/hicolor/32x32/apps"),
-                Path("/usr/share/icons/hicolor/36x36/apps"),
-                Path("/usr/share/icons/hicolor/48x48/apps"),
-                Path("/usr/share/icons/hicolor/64x64/apps"),
-                Path("/usr/share/icons/hicolor/72x72/apps"),
-                Path("/usr/share/icons/hicolor/96x96/apps"),
+        if extension == "png":
+            # The bundled font's bitmap strike is 109px. Prefer the nearest
+            # source that does not need upscaling, then larger sources, followed
+            # by progressively smaller fallbacks.
+            return [
                 Path("/usr/share/icons/hicolor/128x128/apps"),
                 Path("/usr/share/icons/hicolor/192x192/apps"),
                 Path("/usr/share/icons/hicolor/256x256/apps"),
                 Path("/usr/share/icons/hicolor/512x512/apps"),
+                Path("/usr/share/icons/hicolor/96x96/apps"),
+                Path("/usr/share/icons/hicolor/72x72/apps"),
+                Path("/usr/share/icons/hicolor/64x64/apps"),
+                Path("/usr/share/icons/hicolor/48x48/apps"),
+                Path("/usr/share/icons/hicolor/36x36/apps"),
+                Path("/usr/share/icons/hicolor/32x32/apps"),
+                Path("/usr/share/icons/hicolor/24x24/apps"),
+                Path("/usr/share/icons/hicolor/22x22/apps"),
+                Path("/usr/share/icons/hicolor/16x16/apps"),
                 Path("/usr/share/pixmaps"),
             ]
-        else:
-            raise ValueError(f"Unsupported icon extension: {extension}")
-
-        for search_path in search_paths:
-            candidate = search_path / f"{icon_name}.{extension}"
-            if candidate.exists():
-                return candidate
-
-        return None
+        raise ValueError(f"Unsupported icon extension: {extension}")
 
     @staticmethod
     def _global_icon_search(icon_name: str, extension: str) -> Path | None:
@@ -758,9 +773,7 @@ class WorkspaceIconDaemon:
         Returns:
             Path to the icon file, or None if not found.
         """
-        search_dirs = [Path("/usr/share/icons")]
-        if extension == "png":
-            search_dirs.append(Path("/usr/share/pixmaps"))
+        search_dirs = WorkspaceIconDaemon._icon_search_roots()
 
         target_filename = f"{icon_name}.{extension}"
 
@@ -782,6 +795,77 @@ class WorkspaceIconDaemon:
                 continue
 
         return None
+
+    @staticmethod
+    def _icon_search_roots() -> list[Path]:
+        """Return icon roots in user/system precedence order."""
+        data_dirs = [get_xdg_data_home()]
+        data_dirs.extend(
+            Path(item)
+            for item in os.environ.get(
+                "XDG_DATA_DIRS", "/usr/local/share:/usr/share"
+            ).split(":")
+            if item
+        )
+        roots: list[Path] = []
+        for directory in data_dirs:
+            roots.extend([directory / "icons", directory / "pixmaps"])
+        return list(dict.fromkeys(roots))
+
+    @staticmethod
+    def _installed_icon_index() -> dict[str, Path]:
+        """Index icons once while preserving the lookup precedence."""
+        icons: dict[str, Path] = {}
+
+        # Use the same tiers as _resolve_icon_path: first check the curated
+        # application directories for SVG, then PNG. In particular, a color
+        # hicolor PNG must beat an unrelated theme's monochrome SVG.
+        for extension in ("svg", "png"):
+            for directory in WorkspaceIconDaemon._preferred_icon_search_paths(
+                extension
+            ):
+                if not directory.is_dir():
+                    continue
+                try:
+                    for path in sorted(directory.glob(f"*.{extension}")):
+                        if path.is_file():
+                            icons.setdefault(path.stem.casefold(), path)
+                except OSError as exc:
+                    logger.debug("Could not index icons in %s: %s", directory, exc)
+
+        # Only after all preferred application directories have been indexed do
+        # the recursive fallbacks used by _global_icon_search.
+        for extension in ("svg", "png"):
+            for root in WorkspaceIconDaemon._icon_search_roots():
+                if not root.is_dir():
+                    continue
+                try:
+                    for path in sorted(root.rglob(f"*.{extension}")):
+                        if path.is_file():
+                            icons.setdefault(path.stem.casefold(), path)
+                except OSError as exc:
+                    logger.debug("Could not index icons in %s: %s", root, exc)
+        return icons
+
+    @staticmethod
+    def _resolve_icon_from_index(
+        icon_name: str | None, icon_index: dict[str, Path]
+    ) -> Path | None:
+        """Resolve a desktop-entry icon using a precomputed index."""
+        if not icon_name:
+            return None
+        path = Path(icon_name)
+        if (
+            path.is_absolute()
+            and path.is_file()
+            and path.suffix.casefold() in {".svg", ".png"}
+        ):
+            return path
+        known_extensions = {".svg", ".png", ".xpm", ".ico", ".gif", ".jpg", ".jpeg"}
+        search_name = (
+            path.stem if path.suffix.casefold() in known_extensions else icon_name
+        )
+        return icon_index.get(search_name.casefold())
 
     @staticmethod
     def _resolve_icon_path(icon_name: str) -> Path | None:
@@ -838,14 +922,20 @@ class WorkspaceIconDaemon:
         logger.debug("Creating icon font...")
 
         entries = sorted(
-            (entry for entry in program_icon_map.programs.values() if entry.icon_path is not None),
+            (
+                entry
+                for entry in program_icon_map.programs.values()
+                if entry.icon_path is not None
+            ),
             key=lambda entry: entry.unicode_id,
         )
-        icon_paths = [entry.icon_path for entry in entries]
-
-        if not icon_paths:
-            logger.warning("No icons to add to font")
-            return
+        # Every generated font has a stable fallback glyph.  It is used during
+        # the session in which a newly discovered application's real glyph has
+        # been built but cannot yet be loaded by the current renderers.
+        icon_paths = [PLACEHOLDER_ICON_PATH]
+        icon_paths.extend(entry.icon_path for entry in entries)
+        codepoints = [PLACEHOLDER_CODEPOINT]
+        codepoints.extend(entry.unicode_id for entry in entries)
 
         builder = FontBuilder(
             base_font_path=base_font_path,
@@ -854,16 +944,93 @@ class WorkspaceIconDaemon:
             font_family_name=font_family_name,
             pua_start=PUA_START,
             remove_original_symbols=True,
-            codepoints=[entry.unicode_id for entry in entries],
+            codepoints=codepoints,
+            fallback_image_path=PLACEHOLDER_ICON_PATH,
         )
-        builder.build_complete_font()
-        builder.save()
+        try:
+            builder.build_complete_font()
+            builder.save()
+        finally:
+            if builder.ttfont is not None:
+                builder.ttfont.close()
 
         logger.debug("Font created successfully: %s", font_output_path)
 
     def install_icon_font(self) -> None:
-        """Install the generated font and refresh the configured bar."""
+        """Install the generated font without restarting desktop processes."""
         self.font_installer.install(self.font_output_path)
+
+    @staticmethod
+    def notify(summary: str, body: str) -> None:
+        """Send a best-effort desktop notification."""
+        try:
+            subprocess.run(
+                ["notify-send", "--app-name", APP_NAME, summary, body],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            logger.warning("Could not send desktop notification: %s", exc)
+
+    @staticmethod
+    def _desktop_application_paths() -> list[Path]:
+        """Return desktop-entry search roots in XDG precedence order."""
+        data_dirs = [get_xdg_data_home()]
+        data_dirs.extend(
+            Path(item)
+            for item in os.environ.get(
+                "XDG_DATA_DIRS", "/usr/local/share:/usr/share"
+            ).split(":")
+            if item
+        )
+        data_dirs.append(Path("/var/lib/snapd/desktop"))
+        return [directory / "applications" for directory in data_dirs]
+
+    def discover_installed_programs(self) -> bool:
+        """Add every application represented by an installed desktop entry."""
+        desktop_files: dict[str, Path] = {}
+        for directory in self._desktop_application_paths():
+            if not directory.is_dir():
+                continue
+            try:
+                for path in sorted(directory.rglob("*.desktop")):
+                    desktop_files.setdefault(path.stem, path)
+            except OSError as exc:
+                logger.warning(
+                    "Could not scan desktop entries in %s: %s", directory, exc
+                )
+
+        added_any = False
+        icon_index: dict[str, Path] | None = None
+        for desktop_id, desktop_file in desktop_files.items():
+            identifiers = [desktop_id, PROGRAM_NAME_CORRECTIONS.get(desktop_id)]
+            startup_class = self._parse_desktop_value(desktop_file, "StartupWMClass")
+            if startup_class:
+                identifiers.extend(
+                    [startup_class, PROGRAM_NAME_CORRECTIONS.get(startup_class)]
+                )
+            missing_identifiers = [
+                program
+                for program in dict.fromkeys(item for item in identifiers if item)
+                if program not in self.program_icon_map.programs
+            ]
+            if not missing_identifiers:
+                continue
+            if icon_index is None:
+                icon_index = self._installed_icon_index()
+            icon_name = self._parse_desktop_icon(desktop_file)
+            icon_path = self._resolve_icon_from_index(icon_name, icon_index)
+            if icon_path is None and self.use_placeholder_icon:
+                icon_path = PLACEHOLDER_ICON_PATH
+            for program in missing_identifiers:
+                was_added, _ = self.program_icon_map.add_program(program, icon_path)
+                added_any = added_any or was_added
+
+        if added_any:
+            self.program_icon_map.save()
+        logger.info("Discovered %d installed applications", len(desktop_files))
+        return added_any
 
     def _add_missing_programs(self, missing_programs: list[str]) -> bool:
         """Add missing programs to the icon map.
@@ -914,35 +1081,56 @@ class WorkspaceIconDaemon:
         Returns:
             True if any new programs were added and the font was rebuilt.
         """
+        if not self._add_running_programs():
+            logger.debug("No new programs detected; skipping font rebuild")
+            return False
+        self._publish_font_update(new_application=True)
+        return True
+
+    def _add_running_programs(self) -> bool:
+        """Discover programs represented by currently open windows."""
         workspaces_info = self.get_programs_by_workspace(
             self.connection, self.compositor, self.IGNORED_PROGRAMS
         )
-        all_programs = {
-            prog for ws_info in workspaces_info for prog in ws_info.programs
-        }
-        logger.debug("Discovered programs: %s", sorted(all_programs))
-        missing_programs = self.program_icon_map.get_missing_programs(
-            list(all_programs)
+        programs = sorted(
+            {program for workspace in workspaces_info for program in workspace.programs}
         )
-
-        if not missing_programs:
-            logger.debug("No new programs detected; skipping font rebuild")
+        missing = self.program_icon_map.get_missing_programs(programs)
+        if not missing:
             return False
+        added = self._add_missing_programs(missing)
+        if added:
+            self.program_icon_map.save()
+        return added
 
-        added_any = self._add_missing_programs(missing_programs)
-
-        if not added_any:
-            logger.debug("No programs successfully added; skipping font rebuild")
-            return False
-
-        self.program_icon_map.save()
+    def _publish_font_update(self, *, new_application: bool) -> None:
+        """Build and install a font which will become active next session."""
         self.create_icon_font(
             self.program_icon_map,
             self.base_font_path,
             self.font_output_path,
             self.font_family_name,
         )
-        return True
+        self.install_icon_font()
+        if new_application:
+            self.notify(
+                "New application icon installed",
+                "A new application was detected and its icon font was updated. "
+                "Restart the compositor by logging out and back in to display "
+                "the new icon correctly.",
+            )
+
+    def _active_unicode_id(self, program: str) -> int | None:
+        """Return a glyph guaranteed to exist in the font loaded this session."""
+        active = getattr(self, "_active_program_codepoints", None)
+        if active is None:  # Supports lightweight embedders constructing the object.
+            return self.program_icon_map.get_unicode_id(program)
+        unicode_id = active.get(program)
+        if unicode_id is not None:
+            return unicode_id
+        if self.use_placeholder_icon and self._active_placeholder_available:
+            return PLACEHOLDER_CODEPOINT
+        return None
 
     @staticmethod
     def rename_workspace(
@@ -977,8 +1165,7 @@ class WorkspaceIconDaemon:
             icons = [
                 chr(unicode_id)
                 for program in ws_info.programs
-                if (unicode_id := self.program_icon_map.get_unicode_id(program))
-                is not None
+                if (unicode_id := self._active_unicode_id(program)) is not None
             ]
 
             # Process icons based on the unique_icons_mode
@@ -1004,7 +1191,7 @@ class WorkspaceIconDaemon:
         for window in self.connection.get_tree().leaves():
             program = self._get_window_name(window, self.compositor)
             unicode_id = (
-                self.program_icon_map.get_unicode_id(program) if program else None
+                self._active_unicode_id(program) if program else None
             )
             container_id = getattr(window, "id", None)
             if unicode_id is None or not isinstance(container_id, int):
@@ -1120,14 +1307,20 @@ class WorkspaceIconDaemon:
             event: The window event.
         """
         if event.change in {"new", "close", "move", "title"}:
-            if self.process_new_programs():
-                self.install_icon_font()
+            self.process_new_programs()
             self.update_workspace_names()
             self.update_window_titles()
 
     def on_exit(self) -> None:
         """Clean up workspace names and exit gracefully."""
         logger.debug("Cleaning up workspace names...")
+
+        self.reset_desktop_state()
+        self.connection.main_quit()
+        sys.exit(0)
+
+    def reset_desktop_state(self) -> None:
+        """Restore workspace names and title formats without stopping IPC."""
 
         self.reset_window_titles()
 
@@ -1137,60 +1330,12 @@ class WorkspaceIconDaemon:
                 if new_name != workspace.name:
                     self.rename_workspace(self.connection, workspace.name, new_name)
 
-        self.connection.main_quit()
-        sys.exit(0)
-
-    def rebuild_program_icon_map(self) -> bool:
-        """Rebuild the program icon map from scratch.
-
-        Takes all programs currently in the map, clears the map, and
-        re-searches for icons as if starting fresh. Rebuilds the font
-        if any changes are detected.
-
-        Returns:
-            True if the map or font was modified, False otherwise.
-        """
-        logger.debug("Rebuilding program icon map from scratch...")
-
-        # Get all currently known programs
-        known_programs = list(self.program_icon_map.programs.keys())
-
-        if not known_programs:
-            logger.debug("No programs in map to rebuild")
-            return False
-
-        logger.debug("Found %d programs to rebuild", len(known_programs))
-
-        # Clear the map and reset to fresh state
-        self.program_icon_map.programs.clear()
-        self.program_icon_map.next_unicode_id = PUA_START
-
-        # Re-add all programs as if they were new
-        added_any = self._add_missing_programs(known_programs)
-
-        if not added_any:
-            logger.warning("No programs could be re-added during rebuild")
-            return False
-
-        # Save the rebuilt map
-        self.program_icon_map.save()
-
-        # Rebuild the font
-        self.create_icon_font(
-            self.program_icon_map,
-            self.base_font_path,
-            self.font_output_path,
-            self.font_family_name,
-        )
-
-        logger.debug("Program icon map and font rebuilt successfully")
-        return True
-
     def run(self) -> None:
         """Run the daemon main loop."""
         logger.info("Starting workspace icon daemon...")
 
-        self.ensure_startup_font()
+        if not self.ensure_startup_font():
+            return
 
         self.update_workspace_names()
         self.update_window_titles()
@@ -1207,61 +1352,79 @@ class WorkspaceIconDaemon:
         logger.info("Daemon is running. Press Ctrl+C to exit.")
         self.connection.main()
 
-    def ensure_startup_font(self) -> None:
-        """Recover cached and installed fonts before publishing workspace names."""
-        rebuilt = self.process_new_programs()
-        entries = [
-            entry for entry in self.program_icon_map.programs.values()
-            if entry.icon_path is not None
-        ]
-        if not entries:
-            logger.debug("No mapped icons; no font installation needed")
-            return
+    def ensure_startup_font(self) -> bool:
+        """Prepare the next-session font and report whether monitoring may start.
 
-        if not rebuilt and self._cached_font_is_stale(entries):
-            logger.info("Cached icon font is missing or stale; rebuilding")
-            self.create_icon_font(
-                self.program_icon_map, self.base_font_path,
-                self.font_output_path, self.font_family_name,
-            )
-            rebuilt = True
-
+        The installed font is snapshotted before discovery.  That immutable
+        snapshot is the only mapping used for the lifetime of this process.
+        """
         destination = self.font_installer.fonts_dir / self.font_output_path.name
-        if (
-            rebuilt
-            or not destination.is_file()
-            or destination.read_bytes() != self.font_output_path.read_bytes()
-        ):
-            self.install_icon_font()
-        else:
-            logger.debug("Cached and installed icon fonts are current")
-        self.program_icon_map.modified_at_load = False
+        active_font_available = self._snapshot_active_font(destination)
+        map_was_repaired = self.program_icon_map.modified_at_load
+        installed_added = self.discover_installed_programs()
+        running_added = self._add_running_programs()
 
-    def _cached_font_is_stale(self, entries: list[ProgramIconEntry]) -> bool:
-        """Check input timestamps, mappings, family, and required font tables."""
-        if self.program_icon_map.modified_at_load or not self.font_output_path.is_file():
-            return True
-        timestamp = self.font_output_path.stat().st_mtime_ns
-        inputs = [self.program_icon_map.filepath, self.base_font_path]
-        inputs.extend(entry.icon_path for entry in entries if entry.icon_path is not None)
-        if any(path.stat().st_mtime_ns > timestamp for path in inputs):
-            return True
+        expected = {
+            entry.unicode_id
+            for entry in self.program_icon_map.programs.values()
+            if entry.icon_path is not None
+        }
+        installed_is_outdated = expected != set(
+            self._active_program_codepoints.values()
+        )
+
+        if not active_font_available:
+            logger.info("No usable preinstalled icon font; creating one for next login")
+            self._publish_font_update(new_application=False)
+            self.notify(
+                "Icon font installed",
+                "The application icon font has been created. Restart the compositor "
+                "by logging out and back in; the workspace icon daemon will start "
+                "normally then.",
+            )
+            return False
+
+        if (
+            installed_added
+            or running_added
+            or map_was_repaired
+            or installed_is_outdated
+        ):
+            self._publish_font_update(new_application=True)
+
+        self.program_icon_map.modified_at_load = False
+        return True
+
+    def _snapshot_active_font(self, installed_font: Path) -> bool:
+        """Capture mappings which are actually present in the installed font."""
+        self._active_program_codepoints.clear()
+        self._active_placeholder_available = False
+        if not installed_font.is_file():
+            return False
         try:
-            with TTFont(self.font_output_path) as font:
+            with TTFont(installed_font) as font:
                 cmap = font.getBestCmap() or {}
-                expected = {entry.unicode_id for entry in entries}
-                actual = {cp for cp in cmap if 0xE000 <= cp <= 0xF8FF}
-                if actual != expected:
-                    return True
                 if font["name"].getDebugName(1) != self.font_family_name:
-                    return True
+                    return False
                 font["CBLC"]
                 bitmaps = font["CBDT"].strikeData[0]
-                return any(cmap[cp] not in bitmaps for cp in expected)
+                if (
+                    PLACEHOLDER_CODEPOINT not in cmap
+                    or cmap[PLACEHOLDER_CODEPOINT] not in bitmaps
+                ):
+                    return False
+                self._active_placeholder_available = True
+                for program, entry in self.program_icon_map.programs.items():
+                    if (
+                        entry.icon_path is not None
+                        and entry.unicode_id in cmap
+                        and cmap[entry.unicode_id] in bitmaps
+                    ):
+                        self._active_program_codepoints[program] = entry.unicode_id
+                return True
         except Exception as exc:
-            # Invalid/truncated caches are disposable; rebuild from source icons.
-            logger.warning("Cannot validate cached icon font: %s", exc)
-            return True
+            logger.warning("Cannot use installed icon font: %s", exc)
+            return False
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1280,16 +1443,6 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         default=Compositor.AUTO.value,
         help="Compositor/window manager to use (default: detect from IPC)",
     )
-    parser.add_argument(
-        "--bar",
-        choices=[value.value for value in Bar],
-        default=Bar.AUTO.value,
-        help=(
-            "Bar to refresh after font changes "
-            "(default: i3bar for i3, waybar for Sway)"
-        ),
-    )
-
     parser.add_argument(
         "--program-icon-map",
         type=Path,
@@ -1363,21 +1516,21 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
             "must be enabled for the compositor title font (default: enabled)."
         ),
     )
-    parser.add_argument(
-        "--rebuild",
+    reset_group = parser.add_mutually_exclusive_group()
+    reset_group.add_argument(
+        "--reset",
         action="store_true",
         help=(
-            "Rebuild the program icon map and font from scratch at startup. "
-            "Re-searches for icons for all known programs, which recovers from "
-            "changed/moved/added/removed icon files."
+            "Stop a running daemon, restore default workspace/titlebar names, "
+            "remove generated state and exit."
         ),
     )
-    parser.add_argument(
-        "--full-rebuild",
+    reset_group.add_argument(
+        "--reset-and-rebuild",
         action="store_true",
         help=(
-            "Remove the program icon map YAML and font file before rebuilding. "
-            "This performs a completely clean rebuild."
+            "Perform --reset, then discover installed applications and install "
+            "their font for the next login."
         ),
     )
     parser.add_argument(
@@ -1390,6 +1543,68 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _process_start_time(pid: int) -> str | None:
+    """Read Linux's stable process start-time field for PID-reuse protection."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return fields[21]
+    except (OSError, IndexError):
+        return None
+
+
+def write_pid_file(path: Path) -> None:
+    """Publish this daemon's PID and kernel start time."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    start_time = _process_start_time(os.getpid())
+    path.write_text(f"{os.getpid()} {start_time or ''}\n", encoding="utf-8")
+
+
+def remove_own_pid_file(path: Path) -> None:
+    """Remove the PID file only if it still identifies this process."""
+    try:
+        pid = int(path.read_text(encoding="utf-8").split()[0])
+        if pid == os.getpid():
+            path.unlink(missing_ok=True)
+    except (OSError, ValueError, IndexError):
+        pass
+
+
+def stop_running_daemon(path: Path) -> bool:
+    """Ask the daemon recorded in *path* to terminate gracefully."""
+    try:
+        parts = path.read_text(encoding="utf-8").split()
+        pid, recorded_start = int(parts[0]), parts[1]
+    except (OSError, ValueError, IndexError):
+        path.unlink(missing_ok=True)
+        return False
+
+    if pid == os.getpid() or _process_start_time(pid) != recorded_start:
+        path.unlink(missing_ok=True)
+        return False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        path.unlink(missing_ok=True)
+        return False
+    logger.info("Asked running daemon (PID %d) to exit", pid)
+    for _ in range(20):
+        if not path.exists() or _process_start_time(pid) is None:
+            break
+        time.sleep(0.1)
+    return True
+
+
+def remove_generated_state(
+    program_icon_map: Path, font_output: Path, installed_font: Path, pid_path: Path
+) -> None:
+    """Remove all generated daemon state."""
+    for path in (program_icon_map, font_output, installed_font, pid_path):
+        if path.exists():
+            path.unlink()
+            logger.info("Removed %s", path)
+
+
 def main() -> None:
     """Main entry point for the daemon."""
     args = parse_arguments()
@@ -1399,12 +1614,6 @@ def main() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    if args.full_rebuild:
-        for path in [args.program_icon_map, args.font_output]:
-            if path.exists():
-                path.unlink()
-                logger.info(f"Removed file for full rebuild: {path}")
-
     connection = i3ipc.Connection()
     requested_compositor = Compositor(args.compositor)
     compositor = (
@@ -1412,16 +1621,12 @@ def main() -> None:
         if requested_compositor is Compositor.AUTO
         else requested_compositor
     )
-    bar = resolve_bar(Bar(args.bar), compositor)
-    logger.info("Using %s with %s", compositor.value, bar.value)
+    logger.info("Using %s", compositor.value)
 
     daemon = WorkspaceIconDaemon(
         connection=connection,
         compositor=compositor,
-        font_installer=FontInstaller(
-            bar=bar,
-            fonts_dir=get_xdg_data_home() / "fonts",
-        ),
+        font_installer=FontInstaller(fonts_dir=get_xdg_data_home() / "fonts"),
         program_icon_map_path=args.program_icon_map,
         base_font_path=args.base_font,
         font_output_path=args.font_output,
@@ -1432,11 +1637,37 @@ def main() -> None:
         titlebar_icons=args.titlebar_icons,
     )
 
-    # Rebuild icon map and font if requested
-    if args.rebuild:
-        rebuilt = daemon.rebuild_program_icon_map()
-        if rebuilt:
-            daemon.install_icon_font()
+    pid_path = args.font_output.parent / DEFAULT_PID_PATH.name
+    installed_font = daemon.font_installer.fonts_dir / args.font_output.name
+
+    if args.reset or args.reset_and_rebuild:
+        stop_running_daemon(pid_path)
+        # Do this in the reset process too: it covers a stale/missing PID file
+        # and makes the operation idempotent.
+        daemon.workspace_icons = True
+        daemon.titlebar_icons = True
+        daemon.reset_desktop_state()
+        remove_generated_state(
+            args.program_icon_map, args.font_output, installed_font, pid_path
+        )
+        subprocess.run(
+            ["fc-cache", "-f", str(daemon.font_installer.fonts_dir)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if args.reset_and_rebuild:
+            daemon.program_icon_map = ProgramIconMap(args.program_icon_map)
+            daemon.discover_installed_programs()
+            daemon._add_running_programs()
+            daemon._publish_font_update(new_application=False)
+            daemon.notify(
+                "Icon font rebuilt",
+                "The application icon font was reset and rebuilt. Restart the "
+                "compositor by logging out and back in; the daemon can start "
+                "normally next time.",
+            )
+        return
 
     def signal_handler(signum: int, _frame: FrameType | None) -> None:
         logger.info("Received signal %d, exiting gracefully...", signum)
@@ -1445,7 +1676,11 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, signal_handler)
 
-    daemon.run()
+    write_pid_file(pid_path)
+    try:
+        daemon.run()
+    finally:
+        remove_own_pid_file(pid_path)
 
 
 if __name__ == "__main__":

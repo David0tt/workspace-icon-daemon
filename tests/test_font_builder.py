@@ -33,3 +33,25 @@ class FontBuilderTests(TestCase):
                 [PLACEHOLDER_ICON_PATH, PLACEHOLDER_ICON_PATH],
                 codepoints=[0xE000, 0xE000],
             )
+
+    def test_invalid_svg_can_be_replaced_without_losing_its_codepoint(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            invalid = root / "entities.svg"
+            invalid.write_text(
+                '<!DOCTYPE svg [<!ENTITY ns_extend "x">]>'
+                '<svg xmlns="http://www.w3.org/2000/svg">&ns_extend;</svg>',
+                encoding="utf-8",
+            )
+            builder = FontBuilder(
+                DEFAULT_BASE_FONT_PATH,
+                root / "font.ttf",
+                [invalid],
+                remove_original_symbols=True,
+                codepoints=[0xE001],
+                fallback_image_path=PLACEHOLDER_ICON_PATH,
+            ).build_complete_font()
+            try:
+                self.assertEqual(builder.assigned_codepoints, [0xE001])
+            finally:
+                builder.ttfont.close()

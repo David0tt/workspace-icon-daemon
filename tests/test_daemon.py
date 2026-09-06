@@ -62,7 +62,7 @@ class DaemonTests(TestCase):
 
             restored = ProgramIconMap(icon_map.filepath)
             self.assertTrue(restored.modified_at_load)
-            self.assertEqual(restored.get_unicode_id("retained"), 0xE001)
+            self.assertEqual(restored.get_unicode_id("retained"), 0xE002)
             # Shared icon paths must still receive their own assigned glyphs.
             restored.add_program("another", root / "retained.png")
             output = root / "font.ttf"
@@ -74,7 +74,7 @@ class DaemonTests(TestCase):
                 cmap = font.getBestCmap()
                 self.assertEqual(
                     {cp for cp in cmap if 0xE000 <= cp <= 0xF8FF},
-                    {0xE001, 0xE002},
+                    {0xE000, 0xE002, 0xE003},
                 )
                 target_px = font["CBLC"].strikes[0].bitmapSizeTable.ppemY
                 expected = FontBuilder.collect_image(root / "retained.png", target_px)
@@ -94,10 +94,17 @@ class DaemonTests(TestCase):
             icon_map.save()
 
             self.assertTrue(added)
-            self.assertEqual(codepoint, 0xE000)
+            self.assertEqual(codepoint, 0xE001)
             restored = ProgramIconMap(map_path)
             self.assertEqual(restored.get_icon_path("example"), icon)
-            self.assertEqual(restored.get_unicode_id("example"), 0xE000)
+            self.assertEqual(restored.get_unicode_id("example"), 0xE001)
+
+    def test_removed_rebuild_flags_are_replaced_by_reset_flags(self) -> None:
+        args = parse_arguments(["--reset"])
+        self.assertTrue(args.reset)
+        self.assertFalse(args.reset_and_rebuild)
+        rebuilt = parse_arguments(["--reset-and-rebuild"])
+        self.assertTrue(rebuilt.reset_and_rebuild)
 
     def test_sway_collects_native_and_xwayland_windows_in_layout_order(self) -> None:
         workspaces = WorkspaceIconDaemon.get_programs_by_workspace(
@@ -111,18 +118,15 @@ class DaemonTests(TestCase):
         self.assertEqual(daemon._process_icons(["a", "b", "a"]), ["a₂", "b"])
         self.assertEqual(daemon._construct_workspace_name(2, ["a₂", "b"]), "2: a₂b")
 
-    def test_new_cli_identity_and_platform_options(self) -> None:
+    def test_compositor_and_titlebar_cli_options(self) -> None:
         args = parse_arguments(
             [
                 "--compositor",
                 "sway",
-                "--bar",
-                "none",
                 "--titlebar-icons",
             ]
         )
         self.assertEqual(args.compositor, "sway")
-        self.assertEqual(args.bar, "none")
         self.assertTrue(args.workspace_icons)
         self.assertTrue(args.titlebar_icons)
 

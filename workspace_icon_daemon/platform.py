@@ -1,4 +1,4 @@
-"""Compositor and bar-specific behavior."""
+"""Compositor detection and font installation."""
 
 from __future__ import annotations
 
@@ -23,15 +23,6 @@ class Compositor(str, Enum):
     SWAY = "sway"
 
 
-class Bar(str, Enum):
-    """Supported status bars."""
-
-    AUTO = "auto"
-    I3BAR = "i3bar"
-    WAYBAR = "waybar"
-    NONE = "none"
-
-
 class Connection(Protocol):
     """The subset of i3ipc.Connection used for platform detection."""
 
@@ -50,13 +41,6 @@ def detect_compositor(connection: Connection) -> Compositor:
     return Compositor.I3
 
 
-def resolve_bar(bar: Bar, compositor: Compositor) -> Bar:
-    """Resolve the default bar for a detected compositor."""
-    if bar is not Bar.AUTO:
-        return bar
-    return Bar.WAYBAR if compositor is Compositor.SWAY else Bar.I3BAR
-
-
 def program_name(window: object, compositor: Compositor) -> str | None:
     """Return a stable application identifier for an IPC window node."""
     window_class = getattr(window, "window_class", None)
@@ -67,41 +51,22 @@ def program_name(window: object, compositor: Compositor) -> str | None:
 
 @dataclass(frozen=True)
 class FontInstaller:
-    """Install a generated font and refresh the selected bar."""
+    """Install a generated font."""
 
-    bar: Bar
     fonts_dir: Path
 
     def install(self, source: Path) -> Path:
-        """Copy a font into the user font directory and refresh consumers.
+        """Atomically install a font and refresh fontconfig's cache.
 
-        This method performs a careful installation sequence to avoid bar crashes:
-        1. Stop bar (prevents crash when modifying active font)
-        2. Copy font to ~/.local/share/fonts
-        3. Restart bar
-        4. Refresh font cache with fc-cache
-        5. Restart bar again (to load updated cache)
-
-        This sequence is necessary because:
-        - bar crashes if its active font file is modified
-        - fc-cache is slow and shouldn't block bar restart
-        - simply using a compository reload/restart is not enough to ensure fonts are reloaded properly
+        Already-running renderers keep using the font they loaded at session
+        start.  In particular, this method deliberately never restarts a bar or
+        compositor; the replacement becomes usable after the user's next login.
         """
         if not source.is_file():
             raise FileNotFoundError(f"Font file does not exist: {source}")
 
         self.fonts_dir.mkdir(parents=True, exist_ok=True)
         destination = self.fonts_dir / source.name
-        devnull = subprocess.DEVNULL
-
-        if self.bar is not Bar.NONE:
-            subprocess.run(
-                ["pkill", self.bar.value],
-                check=False,
-                stdout=devnull,
-                stderr=devnull,
-            )
-
         # Do not truncate a font file while a renderer may have it mmap'ed.
         # Publish a fully written replacement as a new inode instead.
         temporary_fd, temporary_name = tempfile.mkstemp(
@@ -115,37 +80,12 @@ class FontInstaller:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-        # Restart the bar immediately so the slow font-cache refresh does not
-        # leave it unavailable.
-        if self.bar is not Bar.NONE:
-            subprocess.Popen(
-                [self.bar.value],
-                start_new_session=True,
-                stdout=devnull,
-                stderr=devnull,
-            )
-
         subprocess.run(
             ["fc-cache", "-f", str(self.fonts_dir)],
             check=True,
-            stdout=devnull,
-            stderr=devnull,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-
-        # Restart once more so the bar loads the newly refreshed font cache.
-        if self.bar is not Bar.NONE:
-            subprocess.run(
-                ["pkill", self.bar.value],
-                check=False,
-                stdout=devnull,
-                stderr=devnull,
-            )
-            subprocess.Popen(
-                [self.bar.value],
-                start_new_session=True,
-                stdout=devnull,
-                stderr=devnull,
-            )
 
         logger.info("Installed icon font at %s", destination)
         return destination

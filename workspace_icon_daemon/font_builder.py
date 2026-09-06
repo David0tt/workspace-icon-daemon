@@ -44,6 +44,7 @@ class FontBuilder:
         pua_start: int = PUA_START,
         remove_original_symbols: bool = False,
         codepoints: list[int] | None = None,
+        fallback_image_path: Path | None = None,
     ) -> None:
         """Initialize the FontBuilder.
 
@@ -57,6 +58,8 @@ class FontBuilder:
                 the base font, keeping only the newly added icons.
             codepoints: Explicit PUA codepoints in image_paths order. If omitted,
                 allocate sequentially from pua_start.
+            fallback_image_path: Image to substitute when an input cannot be
+                decoded. If omitted, decoding errors are propagated.
         """
         self.base_font_path = base_font_path
         self.output_font_path = output_font_path
@@ -72,6 +75,7 @@ class FontBuilder:
             if len(set(codepoints)) != len(codepoints):
                 raise ValueError("Codepoints must be unique")
         self.codepoints = list(codepoints) if codepoints is not None else None
+        self.fallback_image_path = fallback_image_path
         self.ttfont: TTFont | None = None
         self.strike_index: int = 0
         self.ppem_x: int = 0
@@ -192,7 +196,9 @@ class FontBuilder:
 
     @staticmethod
     def collect_images_from_paths(
-        paths: list[Path], target_px: int = 128
+        paths: list[Path],
+        target_px: int = 128,
+        fallback_image_path: Path | None = None,
     ) -> list[tuple[Path, bytes]]:
         """Collect PNG and SVG images from a list of file paths.
 
@@ -203,16 +209,34 @@ class FontBuilder:
         Args:
             paths: List of image file paths.
             target_px: Target raster size in pixels (width and height).
+            fallback_image_path: Image used when an input cannot be decoded.
+                Without one, the original exception is raised.
 
         Returns:
             A list of (path, image_bytes) pairs. The image bytes are PNGs
             at the requested size.
         """
         result: list[tuple[Path, bytes]] = []
+        fallback_data: bytes | None = None
         for path in paths:
-            image_data = FontBuilder.collect_image(path, target_px)
-            if image_data is not None:
-                result.append((path, image_data))
+            try:
+                image_data = FontBuilder.collect_image(path, target_px)
+            except Exception as exc:
+                if fallback_image_path is None or path == fallback_image_path:
+                    raise
+                if fallback_data is None:
+                    fallback_data = FontBuilder.collect_image(
+                        fallback_image_path, target_px
+                    )
+                image_data = fallback_data
+                logger.warning(
+                    "Could not decode icon %s (%s: %s); using %s",
+                    path,
+                    type(exc).__name__,
+                    exc,
+                    fallback_image_path,
+                )
+            result.append((path, image_data))
         return result
 
     def load_base_font(self) -> None:
@@ -513,7 +537,9 @@ class FontBuilder:
             self.remove_original_glyphs()
 
         images = FontBuilder.collect_images_from_paths(
-            self.image_paths, target_px=int(self.ppem_y)
+            self.image_paths,
+            target_px=int(self.ppem_y),
+            fallback_image_path=self.fallback_image_path,
         )
 
         if not images:
